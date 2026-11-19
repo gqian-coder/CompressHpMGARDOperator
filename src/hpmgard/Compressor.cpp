@@ -195,7 +195,7 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
         h.residual_quantum[c] = qres;
         if (!refactor) {
             const auto tm = Clock::now();
-            std::vector<uint8_t> b = mgardx::Compress1D(u.data(), npts, tol, std::numeric_limits<double>::infinity(), 0);
+            std::vector<uint8_t> b = mgardx::Compress1D(u.data(), npts, tol, std::numeric_limits<double>::infinity(), 0, static_cast<int>(be->type()));
             st.t_code += Sec(tm, Clock::now());
             pay.add(c, StreamKind::Direct, StreamCodec::MgardX, npts, b);
             st.streams.push_back({c, StreamKind::Direct, "mgardx", npts, b.size()});
@@ -221,8 +221,8 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
         };
         auto code_doubles_mgardx = [&](const std::vector<double>& vals, StreamKind kind, double abs_tol, std::vector<double>& dec) {
             const auto tk = Clock::now();
-            std::vector<uint8_t> b = mgardx::Compress1D(vals.data(), vals.size(), abs_tol, std::numeric_limits<double>::infinity(), 0);
-            mgardx::Decompress(b.data(), b.size(), dec);
+            std::vector<uint8_t> b = mgardx::Compress1D(vals.data(), vals.size(), abs_tol, std::numeric_limits<double>::infinity(), 0, static_cast<int>(be->type()));
+            mgardx::Decompress(b.data(), b.size(), dec, static_cast<int>(be->type()));
             st.t_code += Sec(tk, Clock::now());
             pay.add(c, kind, StreamCodec::MgardX, vals.size(), b);
             st.streams.push_back({c, kind, "mgardx", vals.size(), b.size()});
@@ -345,7 +345,7 @@ void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::ve
         if (s_other) {
             if (s_other->kind == StreamKind::Const) { double v; std::memcpy(&v, payload + s_other->offset, 8); std::fill(comp.begin(), comp.end(), v); }
             else if (s_other->kind == StreamKind::RawDoubles) { std::memcpy(comp.data(), payload + s_other->offset, npts * 8); }
-            else if (s_other->kind == StreamKind::Direct) { std::vector<double> d; mgardx::Decompress(payload + s_other->offset, s_other->bytes, d); if (d.size() != npts) throw std::runtime_error("Decompress: MGARD-X size mismatch"); comp.swap(d); comp.resize(npts); }
+            else if (s_other->kind == StreamKind::Direct) { std::vector<double> d; mgardx::Decompress(payload + s_other->offset, s_other->bytes, d, static_cast<int>(be->type())); if (d.size() != npts) throw std::runtime_error("Decompress: MGARD-X size mismatch"); comp.swap(d); comp.resize(npts); }
             else throw std::runtime_error("Decompress: unknown stream kind");
             InsertComponent(comp, c, h.ncomp, out.data());
             continue;
@@ -357,7 +357,7 @@ void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::ve
         base_dec.assign(nbase, 0.0);
         const double qb = h.base_quantum[c];
         auto decode_doubles = [&](const StreamRec& s, std::vector<double>& vals) {
-            if (s.codec == StreamCodec::MgardX) { mgardx::Decompress(payload + s.offset, s.bytes, vals); if (vals.size() != s.count) throw std::runtime_error("Decompress: MGARD-X count mismatch"); }
+            if (s.codec == StreamCodec::MgardX) { mgardx::Decompress(payload + s.offset, s.bytes, vals, static_cast<int>(be->type())); if (vals.size() != s.count) throw std::runtime_error("Decompress: MGARD-X count mismatch"); }
             else { codec::DecodeSymbols(payload + s.offset, s.bytes, k); if (k.size() != s.count) throw std::runtime_error("Decompress: symbol count mismatch"); vals.resize(k.size()); for (size_t i = 0; i < k.size(); ++i) vals[i] = k[i] * qb; }
         };
         if (h.base_method == BaseMethod::Plain) {
