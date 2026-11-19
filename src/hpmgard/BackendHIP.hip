@@ -62,8 +62,8 @@ std::vector<double> FullMatrix(const std::vector<double>& M1, int n_out, int n_i
 
 struct DeviceBuffer {
     void* p = nullptr; size_t bytes = 0;
-    void reserve(size_t b) { if (b > bytes) { if (p) hipFree(p); HPM_HIP_CHECK(hipMalloc(&p, b)); bytes = b; } }
-    ~DeviceBuffer() { if (p) hipFree(p); }
+    void reserve(size_t b) { if (b > bytes) { if (p) (void)hipFree(p); HPM_HIP_CHECK(hipMalloc(&p, b)); bytes = b; } }
+    ~DeviceBuffer() { if (p) (void)hipFree(p); }
 };
 
 class HipBackend : public Backend {
