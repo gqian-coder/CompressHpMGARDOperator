@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace hpmgard {
 
@@ -28,6 +29,23 @@ public:
     virtual void DequantizeAdd(const int32_t* k, size_t n, double q, double* u) = 0;
     // avg[cell] = mean of the nb base values of the cell
     virtual void CellMeans(const double* base, size_t ncells, int nb, double* avg) = 0;
+
+    // ---- resident-data session (GPU backends keep the component on the device between the calls) ----
+    // Declares `u` (npts values) as the component being processed; Restrict/ResidualFromBase on the same
+    // pointer reuse the device copy. CPU backend: no-op.
+    virtual void BeginComponent(const double* /*u*/, size_t /*npts*/) {}
+    virtual void EndComponent() {}
+    // k = rint((u - P base_dec) / q) without materialising P base_dec on the host (same overflow rule).
+    virtual bool ResidualFromBase(const OperatorSet& ops, const double* base_dec, size_t ncells, double q, int32_t* k, const double* u) {
+        std::vector<double> ub(ncells * static_cast<size_t>(ops.nsp_data));
+        Prolong(ops, base_dec, ncells, ub.data());
+        return ResidualQuantize(u, ub.data(), ub.size(), q, k);
+    }
+    // out = P base_dec + k * q
+    virtual void ReconstructFromBase(const OperatorSet& ops, const double* base_dec, size_t ncells, const int32_t* k, double q, double* out) {
+        Prolong(ops, base_dec, ncells, out);
+        DequantizeAdd(k, ncells * static_cast<size_t>(ops.nsp_data), q, out);
+    }
 };
 
 constexpr double kMaxQuantMagnitude = 1.0e9;

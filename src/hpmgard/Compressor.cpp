@@ -172,7 +172,7 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
     const std::vector<codec::Stage> res_chain = codec::ParseChain(cfg.residual_codec);
 
     Payload pay;
-    std::vector<double> u, base, base_dec, ub, resid, avg, rem;
+    std::vector<double> u, base, base_dec, avg, rem;
     std::vector<int32_t> k;
     for (int c = 0; c < field.ncomp; ++c) {
         const auto tc0 = Clock::now();
@@ -202,6 +202,7 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
             continue;
         }
         // --- base ---
+        struct Session { Backend& b; Session(Backend& be, const double* u, size_t n) : b(be) { b.BeginComponent(u, n); } ~Session() { b.EndComponent(); } } session(*be, u.data(), npts);
         const auto tr = Clock::now();
         const size_t nbase = field.ncells * static_cast<size_t>(ops.nsp_base);
         base.resize(nbase);
@@ -290,10 +291,8 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
         st.t_base += Sec(tb, Clock::now());
         // --- residual against the decoded base (closed loop) ---
         const auto tq = Clock::now();
-        ub.resize(npts);
-        be->Prolong(ops, base_dec.data(), field.ncells, ub.data());
         k.resize(npts);
-        const bool res_ok = be->ResidualQuantize(u.data(), ub.data(), npts, qres, k.data());
+        const bool res_ok = be->ResidualFromBase(ops, base_dec.data(), field.ncells, qres, k.data(), u.data());
         st.t_residual += Sec(tq, Clock::now());
         if (!res_ok) {
             pay.dir.erase(std::remove_if(pay.dir.begin(), pay.dir.end(), [&](const StreamRec& r) { return r.component == c; }), pay.dir.end());
@@ -388,10 +387,9 @@ void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::ve
 #pragma omp parallel for schedule(static)
             for (size_t slot = 0; slot < nbase; ++slot) { const uint32_t d = geom.perm[slot]; base_dec[d] = avg_dec[geom.vid[d]] + k[slot] * qb; }
         }
-        be->Prolong(ops, base_dec.data(), ncells, comp.data());
         codec::DecodeSymbols(payload + s_res->offset, s_res->bytes, k);
         if (k.size() != npts) throw std::runtime_error("Decompress: residual count mismatch");
-        be->DequantizeAdd(k.data(), npts, h.residual_quantum[c], comp.data());
+        be->ReconstructFromBase(ops, base_dec.data(), ncells, k.data(), h.residual_quantum[c], comp.data());
         InsertComponent(comp, c, h.ncomp, out.data());
     }
 }

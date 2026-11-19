@@ -82,9 +82,57 @@ public:
         HPM_HIP_CHECK(hipGetLastError());
         HPM_HIP_CHECK(hipMemcpy(out, d_out_.p, nout * 8, hipMemcpyDeviceToHost));
     }
+    // resident component
+    void BeginComponent(const double* u, size_t npts) override {
+        d_u_.reserve(npts * 8);
+        HPM_HIP_CHECK(hipMemcpy(d_u_.p, u, npts * 8, hipMemcpyHostToDevice));
+        resident_ = u; resident_n_ = npts;
+    }
+    void EndComponent() override { resident_ = nullptr; resident_n_ = 0; }
+    void UploadMatrix(const std::vector<double>& full) { d_m_.reserve(full.size() * 8); HPM_HIP_CHECK(hipMemcpy(d_m_.p, full.data(), full.size() * 8, hipMemcpyHostToDevice)); }
+    void Launch(const void* d_in, int n_out, int n_in, size_t ncells, void* d_out) {
+        const size_t nout = ncells * n_out; const int threads = 256; const size_t blocks = (nout + threads - 1) / threads;
+        hipLaunchKernelGGL(DenseApplyKernel, dim3(blocks), dim3(threads), 0, 0, (const double*)d_m_.p, n_out, n_in, (const double*)d_in, (double*)d_out, ncells);
+        HPM_HIP_CHECK(hipGetLastError());
+    }
     void Restrict(const OperatorSet& ops, const double* u, size_t ncells, double* base) override {
         const std::vector<double> full = ops.tensor ? FullMatrix(ops.RE1, ops.p_base + 1, ops.p + 1, ShapeDim(ops.shape)) : ops.Rfull;
+        if (u == resident_ && resident_n_ == ncells * (size_t)ops.nsp_data) {   // reuse the device copy
+            UploadMatrix(full); d_out_.reserve(ncells * ops.nsp_base * 8);
+            Launch(d_u_.p, ops.nsp_base, ops.nsp_data, ncells, d_out_.p);
+            HPM_HIP_CHECK(hipMemcpy(base, d_out_.p, ncells * ops.nsp_base * 8, hipMemcpyDeviceToHost));
+            return;
+        }
         Apply(full, ops.nsp_base, ops.nsp_data, u, ncells, base);
+    }
+    bool ResidualFromBase(const OperatorSet& ops, const double* base_dec, size_t ncells, double q, int32_t* k, const double* u) override {
+        const size_t npts = ncells * (size_t)ops.nsp_data, nbase = ncells * (size_t)ops.nsp_base;
+        if (!(u == resident_ && resident_n_ == npts)) BeginComponent(u, npts);
+        const std::vector<double> full = ops.tensor ? FullMatrix(ops.Pc1, ops.p + 1, ops.p_base + 1, ShapeDim(ops.shape)) : ops.Pfull;
+        UploadMatrix(full);
+        d_base_.reserve(nbase * 8); HPM_HIP_CHECK(hipMemcpy(d_base_.p, base_dec, nbase * 8, hipMemcpyHostToDevice));
+        d_out_.reserve(npts * 8);
+        Launch(d_base_.p, ops.nsp_data, ops.nsp_base, ncells, d_out_.p);          // d_out_ = P base_dec (stays on the device)
+        d_k_.reserve(npts * 4); d_flag_.reserve(4); HPM_HIP_CHECK(hipMemset(d_flag_.p, 0, 4));
+        const int threads = 256; const size_t blocks = (npts + threads - 1) / threads;
+        hipLaunchKernelGGL(QuantizeKernel, dim3(blocks), dim3(threads), 0, 0, (const double*)d_u_.p, (const double*)d_out_.p, npts, 1.0 / q, (int32_t*)d_k_.p, (int*)d_flag_.p);
+        HPM_HIP_CHECK(hipGetLastError());
+        int overflow = 0; HPM_HIP_CHECK(hipMemcpy(&overflow, d_flag_.p, 4, hipMemcpyDeviceToHost));
+        HPM_HIP_CHECK(hipMemcpy(k, d_k_.p, npts * 4, hipMemcpyDeviceToHost));
+        return overflow == 0;
+    }
+    void ReconstructFromBase(const OperatorSet& ops, const double* base_dec, size_t ncells, const int32_t* k, double q, double* out) override {
+        const size_t npts = ncells * (size_t)ops.nsp_data, nbase = ncells * (size_t)ops.nsp_base;
+        const std::vector<double> full = ops.tensor ? FullMatrix(ops.Pc1, ops.p + 1, ops.p_base + 1, ShapeDim(ops.shape)) : ops.Pfull;
+        UploadMatrix(full);
+        d_base_.reserve(nbase * 8); HPM_HIP_CHECK(hipMemcpy(d_base_.p, base_dec, nbase * 8, hipMemcpyHostToDevice));
+        d_out_.reserve(npts * 8);
+        Launch(d_base_.p, ops.nsp_data, ops.nsp_base, ncells, d_out_.p);
+        d_k_.reserve(npts * 4); HPM_HIP_CHECK(hipMemcpy(d_k_.p, k, npts * 4, hipMemcpyHostToDevice));
+        const int threads = 256; const size_t blocks = (npts + threads - 1) / threads;
+        hipLaunchKernelGGL(DequantizeAddKernel, dim3(blocks), dim3(threads), 0, 0, (const int32_t*)d_k_.p, npts, q, (double*)d_out_.p);
+        HPM_HIP_CHECK(hipGetLastError());
+        HPM_HIP_CHECK(hipMemcpy(out, d_out_.p, npts * 8, hipMemcpyDeviceToHost));
     }
     void Prolong(const OperatorSet& ops, const double* base, size_t ncells, double* u) override {
         const std::vector<double> full = ops.tensor ? FullMatrix(ops.Pc1, ops.p + 1, ops.p_base + 1, ShapeDim(ops.shape)) : ops.Pfull;
@@ -122,7 +170,8 @@ public:
         HPM_HIP_CHECK(hipMemcpy(avg, d_out_.p, ncells * 8, hipMemcpyDeviceToHost));
     }
 private:
-    DeviceBuffer d_in_, d_out_, d_m_, d_k_, d_flag_;
+    DeviceBuffer d_in_, d_out_, d_m_, d_k_, d_flag_, d_u_, d_base_;
+    const double* resident_ = nullptr; size_t resident_n_ = 0;
 };
 
 } // namespace
