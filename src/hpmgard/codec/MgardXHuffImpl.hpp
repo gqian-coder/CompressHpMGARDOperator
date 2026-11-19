@@ -20,10 +20,12 @@ namespace xhuff {
 // Specialised in each translation unit before Impl<Device> is instantiated.
 template <typename Device> bool DeviceErrorCheck();
 
-// HPMGARD_XHUFF_VERIFY=0 disables the decode-and-compare check after an encode (default on: MGARD-X's
-// decoder is not robust against a corrupt stream, so a bad encode must be caught at encode time).
+// HPMGARD_XHUFF_VERIFY=1 enables a decode-and-compare check after every encode (MGARD-X's decoder is not
+// robust against a corrupt stream). Default off: the MGARD-X stages only run on a device that passed
+// mgardx::DeviceWorks(), which already catches the known broken-encoder case, and the check costs about
+// as much as the in-house coder (0.11 s for 33M symbols on an MI250X).
 inline bool VerifyEnabled() {
-    static const bool on = [] { const char* e = std::getenv("HPMGARD_XHUFF_VERIFY"); return !(e && e[0] == '0'); }();
+    static const bool on = [] { const char* e = std::getenv("HPMGARD_XHUFF_VERIFY"); return e && e[0] == '1'; }();
     return on;
 }
 
