@@ -33,7 +33,7 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg, const
 
 // out receives ncells * nsp * ncomp doubles in the original interleaved layout. mesh is needed only
 // for blocks written with DedupSfc; it must be the same mesh (geometry CRCs are checked).
-void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::vector<double>& out, BlockHeader* header_out = nullptr);
+void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::vector<double>& out, BlockHeader* header_out = nullptr, const std::string& device = "auto");
 
 BlockHeader ReadHeader(const uint8_t* bytes, size_t n);
 std::string DescribeHeader(const BlockHeader& h);

@@ -1,4 +1,5 @@
 #include "hpmgard/Compressor.h"
+#include "hpmgard/Backend.h"
 #include "hpmgard/BaseSplit.h"
 #include "hpmgard/Bytes.h"
 #include "hpmgard/MgardX.h"
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <omp.h>
 #include <sstream>
 #include <stdexcept>
@@ -21,10 +23,6 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 inline double Sec(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double>(b - a).count(); }
-
-constexpr double kMaxQuantMagnitude = 1.0e9;   // |x / q| above this -> raw doubles (int32 safety)
-
-inline int32_t Quant(double x, double q) { return static_cast<int32_t>(std::llrint(x / q)); }
 
 // Gather one component of an interleaved block into a contiguous array.
 void ExtractComponent(const FieldView& f, int c, std::vector<double>& out) {
@@ -40,18 +38,6 @@ void InsertComponent(const std::vector<double>& in, int c, int ncomp, double* ou
     if (ncomp == 1) { std::memcpy(out, in.data(), npts * sizeof(double)); return; }
 #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < npts; ++i) out[i * ncomp + c] = in[i];
-}
-
-bool QuantizeChecked(const std::vector<double>& x, double q, std::vector<int32_t>& k) {
-    k.resize(x.size());
-    bool ok = true;
-#pragma omp parallel for schedule(static) reduction(&& : ok)
-    for (size_t i = 0; i < x.size(); ++i) {
-        const double v = x[i] / q;
-        if (!(std::fabs(v) < kMaxQuantMagnitude)) ok = false;
-        k[i] = static_cast<int32_t>(std::llrint(std::fabs(v) < kMaxQuantMagnitude ? v : 0.0));
-    }
-    return ok;
 }
 
 struct Payload {
@@ -146,6 +132,7 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
         if (!ok) cfg.base_method = BaseMethod::CellAvg;   // dedup needs corner geometry and a p1 closed base
     }
     if (cfg.direct_mgardx && !mgardx::Available()) cfg.direct_mgardx = false;
+    std::unique_ptr<Backend> be = MakeBackend(cfg.device);
     st.used = cfg;
 
     // --- statistics ---------------------------------------------------------------------------------
@@ -168,8 +155,8 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
     h.conn_var = meta.conn_var; h.coords_var = meta.coords_var;
     h.var_scale = scale; h.tol_abs.assign(field.ncomp, 0.0); h.base_quantum.assign(field.ncomp, 0.0); h.residual_quantum.assign(field.ncomp, 0.0);
     { int ma, mi, pa; mgardx::Version(ma, mi, pa); h.mgardx_version[0] = ma; h.mgardx_version[1] = mi; h.mgardx_version[2] = pa; }
-    h.writer = std::string("hpmgard ") + std::to_string(kSoftwareVersion[0]) + "." + std::to_string(kSoftwareVersion[1]) + "." + std::to_string(kSoftwareVersion[2]) + " cpu";
-    h.writer_backend = 0;
+    h.writer = std::string("hpmgard ") + std::to_string(kSoftwareVersion[0]) + "." + std::to_string(kSoftwareVersion[1]) + "." + std::to_string(kSoftwareVersion[2]) + " " + be->name();
+    h.writer_backend = static_cast<uint8_t>(be->type());
 
     OperatorSet ops;
     const bool refactor = !cfg.direct_mgardx;
@@ -218,7 +205,7 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
         const auto tr = Clock::now();
         const size_t nbase = field.ncells * static_cast<size_t>(ops.nsp_base);
         base.resize(nbase);
-        ops.Restrict(u.data(), field.ncells, base.data());
+        be->Restrict(ops, u.data(), field.ncells, base.data());
         st.t_refactor += Sec(tr, Clock::now());
         const auto tb = Clock::now();
         const double qb = 2.0 * cfg.base_quantum_ratio * tol;
@@ -244,24 +231,23 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
         if (cfg.base_method == BaseMethod::Plain) {
             if (base_mgardx) { code_doubles_mgardx(base, StreamKind::Avg, qb / 2.0, base_dec); }
             else {
-                base_ok = QuantizeChecked(base, qb, k);
+                k.resize(base.size()); base_ok = be->Quantize(base.data(), base.size(), qb, k.data());
                 if (base_ok) { code_symbols(k, StreamKind::Avg, base_chain, qb); for (size_t i = 0; i < nbase; ++i) base_dec[i] = k[i] * qb; }
             }
         } else if (cfg.base_method == BaseMethod::CellAvg) {
             avg.resize(field.ncells);
-#pragma omp parallel for schedule(static)
-            for (size_t cell = 0; cell < field.ncells; ++cell) { double s = 0.0; for (int j = 0; j < nb; ++j) s += base[cell * nb + j]; avg[cell] = s / nb; }
+            be->CellMeans(base.data(), field.ncells, nb, avg.data());
             std::vector<double> avg_dec;
             if (base_mgardx) code_doubles_mgardx(avg, StreamKind::Avg, qb / 2.0, avg_dec);
             else {
-                base_ok = QuantizeChecked(avg, qb, k);
+                k.resize(avg.size()); base_ok = be->Quantize(avg.data(), avg.size(), qb, k.data());
                 if (base_ok) { code_symbols(k, StreamKind::Avg, base_chain, qb); avg_dec.resize(field.ncells); for (size_t i = 0; i < field.ncells; ++i) avg_dec[i] = k[i] * qb; }
             }
             if (base_ok && nb > 1) {
                 rem.resize(nbase);
 #pragma omp parallel for schedule(static)
                 for (size_t cell = 0; cell < field.ncells; ++cell) for (int j = 0; j < nb; ++j) rem[cell * nb + j] = base[cell * nb + j] - avg_dec[cell];
-                base_ok = QuantizeChecked(rem, qb, k);
+                k.resize(rem.size()); base_ok = be->Quantize(rem.data(), rem.size(), qb, k.data());
                 if (base_ok) {
                     code_symbols(k, StreamKind::Remainder, res_chain, qb);
 #pragma omp parallel for schedule(static)
@@ -279,14 +265,14 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
             std::vector<double> avg_dec;
             if (base_mgardx) code_doubles_mgardx(avg, StreamKind::Avg, qb / 2.0, avg_dec);
             else {
-                base_ok = QuantizeChecked(avg, qb, k);
+                k.resize(avg.size()); base_ok = be->Quantize(avg.data(), avg.size(), qb, k.data());
                 if (base_ok) { code_symbols(k, StreamKind::Avg, base_chain, qb); avg_dec.resize(geom.ngroups); for (size_t i = 0; i < geom.ngroups; ++i) avg_dec[i] = k[i] * qb; }
             }
             if (base_ok) {
                 rem.resize(ndof);
 #pragma omp parallel for schedule(static)
                 for (size_t slot = 0; slot < ndof; ++slot) { const uint32_t d = geom.perm[slot]; rem[slot] = base[d] - avg_dec[geom.vid[d]]; }
-                base_ok = QuantizeChecked(rem, qb, k);
+                k.resize(rem.size()); base_ok = be->Quantize(rem.data(), rem.size(), qb, k.data());
                 if (base_ok) {
                     code_symbols(k, StreamKind::Remainder, res_chain, qb);
 #pragma omp parallel for schedule(static)
@@ -305,11 +291,9 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
         // --- residual against the decoded base (closed loop) ---
         const auto tq = Clock::now();
         ub.resize(npts);
-        ops.Prolong(base_dec.data(), field.ncells, ub.data());
-        resid.resize(npts);
-#pragma omp parallel for schedule(static)
-        for (size_t i = 0; i < npts; ++i) resid[i] = u[i] - ub[i];
-        const bool res_ok = QuantizeChecked(resid, qres, k);
+        be->Prolong(ops, base_dec.data(), field.ncells, ub.data());
+        k.resize(npts);
+        const bool res_ok = be->ResidualQuantize(u.data(), ub.data(), npts, qres, k.data());
         st.t_residual += Sec(tq, Clock::now());
         if (!res_ok) {
             pay.dir.erase(std::remove_if(pay.dir.begin(), pay.dir.end(), [&](const StreamRec& r) { return r.component == c; }), pay.dir.end());
@@ -337,7 +321,7 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
     return res;
 }
 
-void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::vector<double>& out, BlockHeader* header_out) {
+void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::vector<double>& out, BlockHeader* header_out, const std::string& device) {
     BlockHeader h;
     const size_t off = ParseHeader(bytes, n, h);
     if (header_out) *header_out = h;
@@ -348,6 +332,7 @@ void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::ve
     const size_t payload_bytes = n - off;
     OperatorSet ops; bool have_ops = false;
     DedupGeometry geom; bool have_geom = false;
+    std::unique_ptr<Backend> be = MakeBackend(device);
     std::vector<double> comp(npts), base_dec, avg_dec; std::vector<int32_t> k;
     for (int c = 0; c < h.ncomp; ++c) {
         // collect this component's streams
@@ -403,12 +388,10 @@ void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::ve
 #pragma omp parallel for schedule(static)
             for (size_t slot = 0; slot < nbase; ++slot) { const uint32_t d = geom.perm[slot]; base_dec[d] = avg_dec[geom.vid[d]] + k[slot] * qb; }
         }
-        ops.Prolong(base_dec.data(), ncells, comp.data());
+        be->Prolong(ops, base_dec.data(), ncells, comp.data());
         codec::DecodeSymbols(payload + s_res->offset, s_res->bytes, k);
         if (k.size() != npts) throw std::runtime_error("Decompress: residual count mismatch");
-        const double qr = h.residual_quantum[c];
-#pragma omp parallel for schedule(static)
-        for (size_t i = 0; i < npts; ++i) comp[i] += k[i] * qr;
+        be->DequantizeAdd(k.data(), npts, h.residual_quantum[c], comp.data());
         InsertComponent(comp, c, h.ncomp, out.data());
     }
 }

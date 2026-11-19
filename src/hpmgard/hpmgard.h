@@ -3,6 +3,7 @@
 #include "hpmgard/Types.h"
 #include "hpmgard/Quadrature.h"
 #include "hpmgard/Operators.h"
+#include "hpmgard/Backend.h"
 #include "hpmgard/BaseSplit.h"
 #include "hpmgard/codec/Codec.h"
 #include "hpmgard/MgardX.h"

@@ -94,6 +94,7 @@ struct CompressConfig {
     std::string tune_codecs = "huffman|zstd:3,raw|zstd:3,frbp|zstd:3";
     bool allow_mgardx_direct = true;
     // --- runtime ---
+    std::string device = "auto";          // auto | cpu | hip | cuda (backend for the numeric stages)
     int threads = 0;
     bool verbose = false;
 };

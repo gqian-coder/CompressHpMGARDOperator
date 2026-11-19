@@ -101,6 +101,7 @@ size_t CompressHpMGARDOperator::Operate(const char* dataIn, const Dims& /*blockS
     cfg.base_codec = Param("base_codec", mgardx::Available() ? "huffman|zstd:3" : "huffman|zstd:3");
     cfg.residual_codec = Param("residual_codec", "huffman|zstd:3");
     cfg.allow_mgardx_direct = Param("allow_mgardx_direct", "1") != "0";
+    cfg.device = Param("device", "auto");
     cfg.threads = std::stoi(Param("threads", "0"));
     cfg.verbose = Param("verbose", "0") != "0";
     const size_t threshold = std::stoul(Param("threshold", "100000"));
@@ -172,7 +173,7 @@ size_t CompressHpMGARDOperator::InverseOperate(const char* bufferIn, const size_
         mesh = &m_Mesh.Load(mf, cv, xv, h.blockid, h.shape);
     }
     std::vector<double> out;
-    Decompress(in, sizeIn, mesh, out);
+    Decompress(in, sizeIn, mesh, out, nullptr, Param("device", "auto"));
     if (out.size() != total) throw std::runtime_error("[CompressHpMGARDOperator] decoded size mismatch");
     if (h.data_type) { float* f = reinterpret_cast<float*>(dataOut); for (size_t i = 0; i < total; ++i) f[i] = static_cast<float>(out[i]); }
     else std::memcpy(dataOut, out.data(), out_bytes);

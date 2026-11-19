@@ -12,8 +12,15 @@ include(GNUInstallDirs)
 
 option(HPMGARD_ENABLE_MGARDX "Link MGARD-X (mgardx stream codec and the direct-MGARD-X tuner candidate)" ON)
 option(HPMGARD_BUILD_ADIOS2_PLUGIN "Build the ADIOS2 plugin operator" ON)
-option(HPMGARD_ENABLE_HIP "HIP backend (not yet implemented in v1 CPU reference)" OFF)
-option(HPMGARD_ENABLE_CUDA "CUDA backend (not yet implemented in v1 CPU reference)" OFF)
+option(HPMGARD_ENABLE_HIP "Build the HIP (AMD GPU) backend" OFF)
+option(HPMGARD_ENABLE_CUDA "CUDA backend (not yet implemented)" OFF)
+if(HPMGARD_ENABLE_HIP)
+  enable_language(HIP)
+  find_package(hip REQUIRED)
+  if(NOT CMAKE_HIP_ARCHITECTURES)
+    set(CMAKE_HIP_ARCHITECTURES gfx90a)
+  endif()
+endif()
 
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 find_package(ZSTD REQUIRED)
@@ -26,6 +33,7 @@ set(HPMGARD_SOURCES
   src/hpmgard/MgardX.cpp
   src/hpmgard/Header.cpp
   src/hpmgard/Compressor.cpp
+  src/hpmgard/BackendCPU.cpp
   src/hpmgard/Tuner.cpp
   src/hpmgard/codec/Pipeline.cpp
   src/hpmgard/codec/RawFrbpZstd.cpp
@@ -42,6 +50,13 @@ target_include_directories(hpmgard
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/hpmgard)
 target_link_libraries(hpmgard PUBLIC OpenMP::OpenMP_CXX ZSTD::ZSTD)
 target_compile_features(hpmgard PUBLIC cxx_std_17)
+if(HPMGARD_ENABLE_HIP)
+  target_sources(hpmgard PRIVATE src/hpmgard/BackendHIP.hip)
+  set_source_files_properties(src/hpmgard/BackendHIP.hip PROPERTIES LANGUAGE HIP)
+  target_compile_definitions(hpmgard PUBLIC HPMGARD_HAVE_HIP)
+  target_link_libraries(hpmgard PUBLIC hip::host)
+  message(STATUS "hpMGARD: HIP backend enabled (arch ${CMAKE_HIP_ARCHITECTURES})")
+endif()
 
 if(HPMGARD_ENABLE_MGARDX)
   find_package(mgard CONFIG)
