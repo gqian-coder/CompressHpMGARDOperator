@@ -101,6 +101,47 @@ __global__ void Tensor2Kernel(const double* __restrict__ M, int n_out, int n_in,
     }
 }
 
+// Prolongation (few inputs per cell, many outputs): one thread per output value, Kronecker weights
+// evaluated on the fly in the CPU sweep's summation order (i, then j, then k). n_in is small (p_base + 1).
+__global__ void Tensor3ProlongKernel(const double* __restrict__ M, int n_out, int n_in, const double* __restrict__ in, double* __restrict__ out, size_t ncells) {
+    const size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    const int nout3 = n_out * n_out * n_out, nin3 = n_in * n_in * n_in;
+    const size_t total = ncells * (size_t)nout3;
+    if (idx >= total) return;
+    const size_t c = idx / nout3; const int r = static_cast<int>(idx - c * nout3);
+    const int a = r % n_out, b = (r / n_out) % n_out, cc = r / (n_out * n_out);
+    const double* x = in + c * (size_t)nin3;
+    const double* ma = M + a * n_in; const double* mb = M + b * n_in; const double* mc = M + cc * n_in;
+    double s = 0.0;
+    for (int k = 0; k < n_in; ++k) {
+        double sk = 0.0;
+        for (int j = 0; j < n_in; ++j) {
+            double sj = 0.0; const double* xs = x + (k * n_in + j) * n_in;
+            for (int i = 0; i < n_in; ++i) sj += ma[i] * xs[i];
+            sk += mb[j] * sj;
+        }
+        s += mc[k] * sk;
+    }
+    out[idx] = s;
+}
+__global__ void Tensor2ProlongKernel(const double* __restrict__ M, int n_out, int n_in, const double* __restrict__ in, double* __restrict__ out, size_t ncells) {
+    const size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    const int nout2 = n_out * n_out, nin2 = n_in * n_in;
+    const size_t total = ncells * (size_t)nout2;
+    if (idx >= total) return;
+    const size_t c = idx / nout2; const int r = static_cast<int>(idx - c * nout2);
+    const int a = r % n_out, b = r / n_out;
+    const double* x = in + c * (size_t)nin2;
+    const double* ma = M + a * n_in; const double* mb = M + b * n_in;
+    double s = 0.0;
+    for (int j = 0; j < n_in; ++j) {
+        double sj = 0.0; const double* xs = x + j * n_in;
+        for (int i = 0; i < n_in; ++i) sj += ma[i] * xs[i];
+        s += mb[j] * sj;
+    }
+    out[idx] = s;
+}
+
 __global__ void QuantizeKernel(const double* __restrict__ x, const double* __restrict__ sub, size_t n, double inv_q, int32_t* __restrict__ k, int* __restrict__ overflow) {
     const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -158,7 +199,11 @@ public:
             const int dim = ShapeDim(ops.shape);
             const int need = (dim == 3) ? std::max(n_in * n_in * n_out, n_in * n_out * n_out) : n_in * n_out;
             const unsigned grid = GridFor(ncells);
-            if (dim == 3) {
+            if (!restrict && dim == 3) {          // prolongation: one thread per output value
+                hipLaunchKernelGGL(Tensor3ProlongKernel, dim3(GridFor(ncells * (size_t)nsp_out)), dim3(kThreads), 0, 0, M, n_out, n_in, (const double*)d_in, (double*)d_out, ncells);
+            } else if (!restrict && dim == 2) {
+                hipLaunchKernelGGL(Tensor2ProlongKernel, dim3(GridFor(ncells * (size_t)nsp_out)), dim3(kThreads), 0, 0, M, n_out, n_in, (const double*)d_in, (double*)d_out, ncells);
+            } else if (dim == 3) {
                 if (need <= 64) hipLaunchKernelGGL((Tensor3Kernel<64>), dim3(grid), dim3(kThreads), 0, 0, M, n_out, n_in, (const double*)d_in, (double*)d_out, ncells);
                 else if (need <= 128) hipLaunchKernelGGL((Tensor3Kernel<128>), dim3(grid), dim3(kThreads), 0, 0, M, n_out, n_in, (const double*)d_in, (double*)d_out, ncells);
                 else if (need <= 256) hipLaunchKernelGGL((Tensor3Kernel<256>), dim3(grid), dim3(kThreads), 0, 0, M, n_out, n_in, (const double*)d_in, (double*)d_out, ncells);
