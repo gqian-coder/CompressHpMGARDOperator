@@ -74,6 +74,9 @@ struct CompressConfig {
     NodeSet node_set = NodeSet::GaussLegendre;
     Norm norm = Norm::RelL2;
     double tolerance = 1e-3; // relative (RelL2, RelRange) or absolute (Abs); the pointwise bound of the output
+    // Optional per-component absolute pointwise bounds (size ncomp). When set they override tolerance/norm,
+    // e.g. a driver passing one variable-wide bound to every block of a multi-block variable.
+    std::vector<double> abs_tolerance;
     // --- hierarchy ---
     int base_order = 1;                      // 0 = cell mean, 1 = trilinear, ..., p = no refactoring
     BaseRepresentation base_rep = BaseRepresentation::Closed;
@@ -88,7 +91,7 @@ struct CompressConfig {
     // --- tuner ---
     bool tune = false;
     double tune_sample = 0.03;
-    std::string tune_codecs = "huffman|zstd:3,frbp|zstd:3,frbp";
+    std::string tune_codecs = "huffman|zstd:3,raw|zstd:3,frbp|zstd:3";
     bool allow_mgardx_direct = true;
     // --- runtime ---
     int threads = 0;

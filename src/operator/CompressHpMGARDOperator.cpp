@@ -74,9 +74,21 @@ size_t CompressHpMGARDOperator::Operate(const char* dataIn, const Dims& /*blockS
     cfg.node_set = Lower(Param("node_set", "gauss")) == "lobatto" ? NodeSet::GaussLobatto : NodeSet::GaussLegendre;
     const std::string tol = Param("tolerance", Param("accuracy"));
     if (tol.empty()) throw std::invalid_argument("[CompressHpMGARDOperator] missing parameter 'tolerance'");
-    cfg.tolerance = std::stod(tol);
     const std::string mode = Upper(Param("mode", "REL_L2"));
     cfg.norm = mode == "ABS" ? Norm::Abs : mode == "REL_RANGE" || mode == "REL_VAL" ? Norm::RelRange : Norm::RelL2;
+    {   // "tolerance" may be a comma-separated per-component list of ABSOLUTE bounds (one bound per variable
+        // and component across all blocks, as a driver with a variable-wide pre-pass supplies)
+        std::vector<double> list; std::string cur;
+        for (char ch : tol) { if (ch == ',') { if (!cur.empty()) list.push_back(std::stod(cur)); cur.clear(); } else cur += ch; }
+        if (!cur.empty()) list.push_back(std::stod(cur));
+        if (list.empty()) throw std::invalid_argument("[CompressHpMGARDOperator] empty 'tolerance'");
+        cfg.tolerance = list[0];
+        if (list.size() > 1 || cfg.norm == Norm::Abs) {
+            if (list.size() == 1) list.assign(cfg.ncomp, list[0]);
+            if (static_cast<int>(list.size()) != cfg.ncomp) throw std::invalid_argument("[CompressHpMGARDOperator] 'tolerance' list must have one entry per component");
+            cfg.abs_tolerance = list; cfg.norm = Norm::Abs;
+        }
+    }
     cfg.tune = Lower(Param("tuning", "auto")) != "fixed";
     cfg.tune_sample = std::stod(Param("tuning_sample", "0.03"));
     cfg.tune_codecs = Param("tune_codecs", cfg.tune_codecs);

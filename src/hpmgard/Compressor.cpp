@@ -123,6 +123,7 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
     if (field.nsp != NumSP(cfg.shape, cfg.p)) throw std::invalid_argument("Compress: nsp does not match (shape, p)");
     if (field.ncomp != cfg.ncomp) throw std::invalid_argument("Compress: ncomp mismatch");
     if (cfg.base_order < 0 || cfg.base_order > cfg.p) throw std::invalid_argument("Compress: base_order must be in [0, p]");
+    if (!cfg.abs_tolerance.empty() && cfg.abs_tolerance.size() != static_cast<size_t>(cfg.ncomp)) throw std::invalid_argument("Compress: abs_tolerance must have ncomp entries");
     const size_t npts = field.ncells * static_cast<size_t>(field.nsp);
     const uint64_t raw_bytes = field.size() * sizeof(double);
 
@@ -162,7 +163,7 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
             throw std::invalid_argument("Compress: BlockMeta.dims do not match the field (dims[0] must be the cell count and the product the value count)");
     }
     h.shape = cfg.shape; h.p = static_cast<uint8_t>(cfg.p); h.nsp = static_cast<uint16_t>(field.nsp); h.ncomp = static_cast<uint8_t>(field.ncomp);
-    h.node_set = cfg.node_set; h.base_order = static_cast<uint8_t>(cfg.base_order); h.base_method = cfg.base_method; h.norm = cfg.norm; h.tolerance = cfg.tolerance;
+    h.node_set = cfg.node_set; h.base_order = static_cast<uint8_t>(cfg.base_order); h.base_method = cfg.base_method; h.norm = cfg.abs_tolerance.empty() ? cfg.norm : Norm::Abs; h.tolerance = cfg.abs_tolerance.empty() ? cfg.tolerance : cfg.abs_tolerance[0];
     h.base_codec = cfg.base_codec; h.residual_codec = cfg.residual_codec; h.direct_mgardx = cfg.direct_mgardx ? 1 : 0;
     h.conn_var = meta.conn_var; h.coords_var = meta.coords_var;
     h.var_scale = scale; h.tol_abs.assign(field.ncomp, 0.0); h.base_quantum.assign(field.ncomp, 0.0); h.residual_quantum.assign(field.ncomp, 0.0);
@@ -189,7 +190,7 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
     for (int c = 0; c < field.ncomp; ++c) {
         const auto tc0 = Clock::now();
         ExtractComponent(field, c, u);
-        const double tol = (cfg.norm == Norm::Abs) ? cfg.tolerance : cfg.tolerance * scale[c];
+        const double tol = !cfg.abs_tolerance.empty() ? cfg.abs_tolerance[c] : (cfg.norm == Norm::Abs) ? cfg.tolerance : cfg.tolerance * scale[c];
         h.tol_abs[c] = tol;
         // constant component: one value
         if (fs.hi[c] == fs.lo[c]) {
