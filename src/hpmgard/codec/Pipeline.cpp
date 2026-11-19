@@ -1,4 +1,5 @@
 #include "hpmgard/codec/Codec.h"
+#include "hpmgard/codec/MgardXHuff.h"
 #include "hpmgard/Bytes.h"
 #include <algorithm>
 #include <cctype>
@@ -18,6 +19,7 @@ const char* StageName(StageId id) {
     case StageId::FRBP: return "frbp";
     case StageId::Huffman: return "huffman";
     case StageId::Zstd: return "zstd";
+    case StageId::MgardXHuffman: return "xhuff";
     }
     return "?";
 }
@@ -37,6 +39,7 @@ std::vector<Stage> ParseChain(const std::string& spec) {
             else if (name == "frbp") s.id = StageId::FRBP;
             else if (name == "huffman" || name == "huff") { s.id = StageId::Huffman; s.param = param < 0 ? 16 : param; }
             else if (name == "zstd") { s.id = StageId::Zstd; s.param = param < 0 ? 3 : param; }
+            else if (name == "xhuff" || name == "mgardx_huffman") { s.id = StageId::MgardXHuffman; s.param = param < 0 ? 0 : param; }
             else throw std::invalid_argument("ParseChain: unknown stage '" + name + "' in '" + spec + "'");
             chain.push_back(s);
         }
@@ -55,18 +58,30 @@ std::string ChainString(const std::vector<Stage>& chain) {
     for (size_t i = 0; i < chain.size(); ++i) {
         if (i) s += '|';
         s += StageName(chain[i].id);
-        if (chain[i].id == StageId::Zstd || chain[i].id == StageId::Huffman) s += ':' + std::to_string(chain[i].param);
+        if (chain[i].id == StageId::Zstd || chain[i].id == StageId::Huffman || chain[i].id == StageId::MgardXHuffman) s += ':' + std::to_string(chain[i].param);
     }
     return s;
 }
 
-std::vector<uint8_t> EncodeSymbols(const int32_t* sym, size_t n, const std::vector<Stage>& chain, double eb_info) {
+bool StageAvailable(StageId id, int device) {
+    if (id == StageId::MgardXHuffman) return xhuff::Available(device);
+    return true;
+}
+
+// xhuff stage payload: u8 mode (1 = MGARD-X stream follows, 0 = canonical Huffman fallback follows)
+std::vector<uint8_t> EncodeSymbols(const int32_t* sym, size_t n, const std::vector<Stage>& chain, double eb_info, int device) {
     if (chain.empty()) throw std::invalid_argument("EncodeSymbols: empty chain");
     std::vector<uint8_t> cur;
     switch (chain[0].id) {
     case StageId::Raw: cur = RawEncode(sym, n); break;
     case StageId::FRBP: cur = FrbpEncode(sym, n, eb_info); break;
     case StageId::Huffman: cur = HuffmanEncode(sym, n, chain[0].param); break;
+    case StageId::MgardXHuffman: {
+        std::vector<uint8_t> x;
+        if (xhuff::Encode(device, sym, n, chain[0].param, x)) { cur.reserve(x.size() + 1); cur.push_back(1); cur.insert(cur.end(), x.begin(), x.end()); }
+        else { x = HuffmanEncode(sym, n, 16); cur.reserve(x.size() + 1); cur.push_back(0); cur.insert(cur.end(), x.begin(), x.end()); }
+        break;
+    }
     default: throw std::invalid_argument("EncodeSymbols: bad first stage");
     }
     std::vector<uint64_t> sizes{cur.size()};
@@ -91,7 +106,7 @@ size_t PeekSymbolCount(const uint8_t* b, size_t nb) {
     return r.u64();
 }
 
-size_t DecodeSymbols(const uint8_t* b, size_t nb, std::vector<int32_t>& out) {
+size_t DecodeSymbols(const uint8_t* b, size_t nb, std::vector<int32_t>& out, int device) {
     ByteReader r(b, nb);
     if (r.u8() != kContainerMagic) throw std::runtime_error("DecodeSymbols: bad container magic");
     const int nstages = r.u8();
@@ -111,6 +126,12 @@ size_t DecodeSymbols(const uint8_t* b, size_t nb, std::vector<int32_t>& out) {
     case StageId::Raw: RawDecode(cur.data(), cur.size(), out.data(), n); break;
     case StageId::FRBP: FrbpDecode(cur.data(), cur.size(), out.data(), n); break;
     case StageId::Huffman: HuffmanDecode(cur.data(), cur.size(), out.data(), n); break;
+    case StageId::MgardXHuffman: {
+        if (cur.empty()) throw std::runtime_error("DecodeSymbols: empty xhuff payload");
+        if (cur[0] == 1) { if (!xhuff::Decode(device, cur.data() + 1, cur.size() - 1, out.data(), n, chain[0].param)) throw std::runtime_error("DecodeSymbols: MGARD-X Huffman decode failed (is MGARD-X available in this build?)"); }
+        else HuffmanDecode(cur.data() + 1, cur.size() - 1, out.data(), n);
+        break;
+    }
     default: throw std::runtime_error("DecodeSymbols: bad first stage");
     }
     return n;

@@ -38,6 +38,7 @@ set(HPMGARD_SOURCES
   src/hpmgard/codec/Pipeline.cpp
   src/hpmgard/codec/RawFrbpZstd.cpp
   src/hpmgard/codec/Huffman.cpp
+  src/hpmgard/codec/MgardXHuff.cpp
   src/hpmgard/ported/rp_operators.cpp
   src/hpmgard/ported/tet_rp_operators.cpp
   src/hpmgard/ported/prism_rp_operators.cpp
@@ -63,6 +64,21 @@ if(HPMGARD_ENABLE_MGARDX)
   if(mgard_FOUND)
     target_link_libraries(hpmgard PUBLIC mgard::mgard)
     target_compile_definitions(hpmgard PUBLIC HPMGARD_HAVE_MGARDX)
+    # The SERIAL instantiation of the MGARD-X Huffman stage lives in its own target WITHOUT OpenMP:
+    # MGARD-X declares serial_dev_id with '#pragma omp threadprivate' while libmgard defines it as a
+    # plain int (built without OpenMP). Compiled with OpenMP the TU would reference it as TLS and the
+    # link fails (R_X86_64_TLSGD). The Cray wrapper re-appends -fopenmp, so a per-source -fno-openmp
+    # does not work; a separate target does (same approach as CompressMGARDCentroidOperator).
+    add_library(hpmgard_xhuff_serial STATIC src/hpmgard/codec/MgardXHuff_SERIAL.cpp)
+    target_include_directories(hpmgard_xhuff_serial PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(hpmgard_xhuff_serial PRIVATE mgard::mgard)
+    target_compile_definitions(hpmgard_xhuff_serial PRIVATE HPMGARD_HAVE_MGARDX)
+    set_target_properties(hpmgard_xhuff_serial PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_link_libraries(hpmgard PUBLIC hpmgard_xhuff_serial)
+    if(HPMGARD_ENABLE_HIP)
+      target_sources(hpmgard PRIVATE src/hpmgard/codec/MgardXHuff_HIP.hip)
+      set_source_files_properties(src/hpmgard/codec/MgardXHuff_HIP.hip PROPERTIES LANGUAGE HIP COMPILE_DEFINITIONS "__HIP_PLATFORM_AMD__;MGARDX_COMPILE_HIP")
+    endif()
     message(STATUS "hpMGARD: MGARD-X ${mgard_VERSION} enabled (${mgard_DIR})")
   else()
     message(WARNING "hpMGARD: MGARD-X requested but not found; the mgardx codec and the direct candidate are disabled")
@@ -82,7 +98,11 @@ if(HPMGARD_BUILD_ADIOS2_PLUGIN AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/opera
 endif()
 
 # ---------------------------------------------------------------- install + package
-install(TARGETS hpmgard EXPORT hpmgardTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+set(HPMGARD_INSTALL_TARGETS hpmgard)
+if(TARGET hpmgard_xhuff_serial)
+  list(APPEND HPMGARD_INSTALL_TARGETS hpmgard_xhuff_serial)
+endif()
+install(TARGETS ${HPMGARD_INSTALL_TARGETS} EXPORT hpmgardTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY src/hpmgard DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.h")
 install(EXPORT hpmgardTargets NAMESPACE hpmgard:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/hpmgard)
 include(CMakePackageConfigHelpers)

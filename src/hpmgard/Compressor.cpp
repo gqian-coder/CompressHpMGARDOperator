@@ -215,7 +215,7 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
         const int nb = ops.nsp_base;
         auto code_symbols = [&](const std::vector<int32_t>& syms, StreamKind kind, const std::vector<codec::Stage>& chain, double q) {
             const auto tk = Clock::now();
-            std::vector<uint8_t> b = codec::EncodeSymbols(syms.data(), syms.size(), chain, q);
+            std::vector<uint8_t> b = codec::EncodeSymbols(syms.data(), syms.size(), chain, q, static_cast<int>(be->type()));
             st.t_code += Sec(tk, Clock::now());
             pay.add(c, kind, StreamCodec::SymbolChain, syms.size(), b);
             st.streams.push_back({c, kind, codec::ChainString(chain), syms.size(), b.size()});
@@ -357,7 +357,7 @@ void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::ve
         const double qb = h.base_quantum[c];
         auto decode_doubles = [&](const StreamRec& s, std::vector<double>& vals) {
             if (s.codec == StreamCodec::MgardX) { mgardx::Decompress(payload + s.offset, s.bytes, vals, static_cast<int>(be->type())); if (vals.size() != s.count) throw std::runtime_error("Decompress: MGARD-X count mismatch"); }
-            else { codec::DecodeSymbols(payload + s.offset, s.bytes, k); if (k.size() != s.count) throw std::runtime_error("Decompress: symbol count mismatch"); vals.resize(k.size()); for (size_t i = 0; i < k.size(); ++i) vals[i] = k[i] * qb; }
+            else { codec::DecodeSymbols(payload + s.offset, s.bytes, k, static_cast<int>(be->type())); if (k.size() != s.count) throw std::runtime_error("Decompress: symbol count mismatch"); vals.resize(k.size()); for (size_t i = 0; i < k.size(); ++i) vals[i] = k[i] * qb; }
         };
         if (h.base_method == BaseMethod::Plain) {
             if (!s_avg) throw std::runtime_error("Decompress: base stream missing");
@@ -366,7 +366,7 @@ void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::ve
             if (!s_avg) throw std::runtime_error("Decompress: average stream missing");
             decode_doubles(*s_avg, avg_dec);
             if (s_rem) {
-                codec::DecodeSymbols(payload + s_rem->offset, s_rem->bytes, k);
+                codec::DecodeSymbols(payload + s_rem->offset, s_rem->bytes, k, static_cast<int>(be->type()));
                 if (k.size() != nbase) throw std::runtime_error("Decompress: remainder count mismatch");
 #pragma omp parallel for schedule(static)
                 for (size_t cell = 0; cell < ncells; ++cell) for (int j = 0; j < nb; ++j) base_dec[cell * nb + j] = avg_dec[cell] + k[cell * nb + j] * qb;
@@ -382,12 +382,12 @@ void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::ve
             }
             if (!s_avg || !s_rem) throw std::runtime_error("Decompress: dedup streams missing");
             decode_doubles(*s_avg, avg_dec);
-            codec::DecodeSymbols(payload + s_rem->offset, s_rem->bytes, k);
+            codec::DecodeSymbols(payload + s_rem->offset, s_rem->bytes, k, static_cast<int>(be->type()));
             if (k.size() != nbase) throw std::runtime_error("Decompress: remainder count mismatch");
 #pragma omp parallel for schedule(static)
             for (size_t slot = 0; slot < nbase; ++slot) { const uint32_t d = geom.perm[slot]; base_dec[d] = avg_dec[geom.vid[d]] + k[slot] * qb; }
         }
-        codec::DecodeSymbols(payload + s_res->offset, s_res->bytes, k);
+        codec::DecodeSymbols(payload + s_res->offset, s_res->bytes, k, static_cast<int>(be->type()));
         if (k.size() != npts) throw std::runtime_error("Decompress: residual count mismatch");
         be->ReconstructFromBase(ops, base_dec.data(), ncells, k.data(), h.residual_quantum[c], comp.data());
         InsertComponent(comp, c, h.ncomp, out.data());
