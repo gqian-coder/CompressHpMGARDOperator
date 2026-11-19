@@ -26,8 +26,15 @@ inline uint32_t BlockSize() {
     static const uint32_t v = [] { const char* e = std::getenv("HPMGARD_XHUFF_BLOCK"); const long x = e ? std::atol(e) : 0; return x >= 64 && x <= (1l << 24) ? static_cast<uint32_t>(x) : 20480u; }();
     return v;
 }
-// Streams shorter than this use the in-house Huffman (MGARD-X writes a ~34 KB codebook block per stream).
+// Streams shorter than this use the in-house Huffman (MGARD-X's serialised codebook costs ~4 bytes per dictionary entry).
 constexpr size_t kMinSymbols = size_t(1) << 16;
+// Dictionary actually used for a stream: the smallest power of two above its largest zigzag code, at least
+// 256 and at most DictSize(). MGARD-X serialises ~4 bytes per entry, so a small alphabet should not pay
+// for 8192 entries (34 KB per stream); the chosen size is recorded in the payload.
+inline uint32_t ChooseDict(uint32_t zmax) {
+    uint32_t d = 256; while (d <= zmax) d <<= 1;
+    return d > DictSize() ? DictSize() : d;
+}
 
 bool Available(int device);               // 0 = SERIAL (needs MGARD-X), 1 = HIP (needs the HIP build + a device)
 bool AlphabetOk(XType t, uint32_t zmin, uint32_t zmax);   // false when the type cannot code this code range

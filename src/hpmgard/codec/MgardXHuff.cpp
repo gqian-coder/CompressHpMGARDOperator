@@ -18,7 +18,7 @@ bool DecodeSerial(const uint8_t* b, size_t nb, std::vector<int32_t>& codes, size
 #define HPM_XDEV_DECLS \
     bool DevicePresent(); \
     bool Encode(const std::vector<int32_t>& codes, XType t, int level, uint32_t dict, uint32_t block, std::vector<uint8_t>& out); \
-    bool EncodeDevice(const int32_t* d_sym, size_t n, XType t, int level, uint32_t dict, uint32_t block, std::vector<uint8_t>& out); \
+    bool EncodeDevice(const int32_t* d_sym, size_t n, XType t, int level, uint32_t& dict, uint32_t block, std::vector<uint8_t>& out); \
     bool Decode(const uint8_t* b, size_t nb, std::vector<int32_t>& codes, size_t n, XType t, int level, uint32_t dict, uint32_t block); \
     const int32_t* DecodeDevice(const uint8_t* b, size_t nb, size_t n, XType t, int level, uint32_t dict, uint32_t block); \
     void Warmup(XType t, int level);
@@ -75,16 +75,17 @@ bool Available(int device) {
 
 bool Encode(int device, const int32_t* sym, size_t n, XType t, int level, std::vector<uint8_t>& out) {
     if (!Available(device) || n < kMinSymbols) return false;
-    const uint32_t dict = DictSize(), block = BlockSize();
+    const uint32_t dict_max = DictSize(), block = BlockSize();
     std::vector<int32_t> codes(n);
     uint32_t zmin = 0xFFFFFFFFu, zmax = 0;
     for (size_t i = 0; i < n; ++i) {
         const uint32_t z = Zigzag(sym[i]);
-        if (z >= dict) return false;               // outside the MGARD-X dictionary: let the caller fall back
+        if (z >= dict_max) return false;           // outside the MGARD-X dictionary: let the caller fall back
         codes[i] = static_cast<int32_t>(z);
         zmin = std::min(zmin, z); zmax = std::max(zmax, z);
     }
     if (!AlphabetOk(t, zmin, zmax)) return false;
+    const uint32_t dict = ChooseDict(zmax);
     std::vector<uint8_t> x;
     bool ok = false;
 #ifdef HPMGARD_HAVE_MGARDX
@@ -103,16 +104,16 @@ bool Encode(int device, const int32_t* sym, size_t n, XType t, int level, std::v
 
 bool EncodeDevice(int device, const int32_t* d_sym, size_t n, XType t, int level, std::vector<uint8_t>& out) {
     if (!d_sym || n < kMinSymbols || !Available(device)) return false;
-    std::vector<uint8_t> x; bool ok = false;
+    std::vector<uint8_t> x; bool ok = false; uint32_t dict = DictSize();   // the device path picks the dictionary (ChooseDict) and reports it
 #if defined(HPMGARD_HAVE_MGARDX) && defined(HPMGARD_HAVE_HIP)
-    if (device == 1) ok = hip::EncodeDevice(d_sym, n, t, level, DictSize(), BlockSize(), x);
+    if (device == 1) ok = hip::EncodeDevice(d_sym, n, t, level, dict, BlockSize(), x);
 #endif
 #if defined(HPMGARD_HAVE_MGARDX) && defined(HPMGARD_HAVE_CUDA)
-    if (device == 2) ok = cuda::EncodeDevice(d_sym, n, t, level, DictSize(), BlockSize(), x);
+    if (device == 2) ok = cuda::EncodeDevice(d_sym, n, t, level, dict, BlockSize(), x);
 #endif
     (void)t; (void)level;
     if (!ok) return false;
-    Finish(out, DictSize(), BlockSize(), x);
+    Finish(out, dict, BlockSize(), x);
     return true;
 }
 

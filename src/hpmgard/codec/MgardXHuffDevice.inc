@@ -70,7 +70,8 @@ bool Decode(const uint8_t* b, size_t nb, std::vector<int32_t>& codes, size_t n, 
 
 // Symbols already on the device: zigzag + range check on the device, wrap without copying, compress with
 // the persistent object, optional device compare.
-bool EncodeDevice(const int32_t* d_sym, size_t n, XType t, int level, uint32_t dict, uint32_t block, std::vector<uint8_t>& out) {
+// dict: in = maximum dictionary allowed, out = dictionary used (ChooseDict of the largest code)
+bool EncodeDevice(const int32_t* d_sym, size_t n, XType t, int level, uint32_t& dict, uint32_t block, std::vector<uint8_t>& out) {
     I::InitOnce();
     std::lock_guard<std::mutex> lk(I::Mutex());
     try {
@@ -83,6 +84,7 @@ bool EncodeDevice(const int32_t* d_sym, size_t n, XType t, int level, uint32_t d
         if (!DeviceErrorCheck<HPM_XDEVICE>()) return false;
         if (mm[0] >= dict) return false;            // outside the MGARD-X dictionary: let the caller fall back
         if (!AlphabetOk(t, mm[1], mm[0])) return false;
+        dict = ChooseDict(mm[0]);
         I::Entry& e = I::Get(t, level, dict, block, static_cast<mgard_x::SIZE>(n));
         I::SymArray arr({static_cast<mgard_x::SIZE>(n)}, s.codes);   // external allocation: no copy, not freed
         if (!I::CompressArray(e, arr, out)) return false;
@@ -130,8 +132,8 @@ void Warmup(XType t, int level) {
     int32_t* d = nullptr;
     if (hipMalloc((void**)&d, n * sizeof(int32_t)) != hipSuccess) return;
     if (hipMemcpy(d, v.data(), n * sizeof(int32_t), hipMemcpyHostToDevice) == hipSuccess) {
-        std::vector<uint8_t> out;
-        if (EncodeDevice(d, n, t, level, DictSize(), BlockSize(), out) && out.size() > 8) (void)DecodeDevice(out.data(), out.size(), n, t, level, DictSize(), BlockSize());
+        std::vector<uint8_t> out; uint32_t dict = DictSize();
+        if (EncodeDevice(d, n, t, level, dict, BlockSize(), out) && out.size() > 8) (void)DecodeDevice(out.data(), out.size(), n, t, level, dict, BlockSize());
     }
     (void)hipFree(d);
 }
