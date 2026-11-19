@@ -98,8 +98,8 @@ size_t CompressHpMGARDOperator::Operate(const char* dataIn, const Dims& /*blockS
     const bool have_mesh = !meshfile.empty() && !conn.empty() && !coords.empty();
     cfg.base_method = bm == "dedup_sfc" || bm == "dedup" ? BaseMethod::DedupSfc : bm == "plain" ? BaseMethod::Plain : bm == "cellavg" ? BaseMethod::CellAvg : (have_mesh ? BaseMethod::DedupSfc : BaseMethod::CellAvg);
     cfg.base_quantum_ratio = std::stod(Param("base_quantum", "0.5"));
-    cfg.base_codec = Param("base_codec", mgardx::Available() ? "huffman|zstd:3" : "huffman|zstd:3");
-    cfg.residual_codec = Param("residual_codec", "huffman|zstd:3");
+    cfg.base_codec = Param("base_codec", "auto");          // auto: xhuff|zstd:3 on a GPU, huffman|zstd:3 on the CPU
+    cfg.residual_codec = Param("residual_codec", "auto");
     cfg.allow_mgardx_direct = Param("allow_mgardx_direct", "1") != "0";
     cfg.device = Param("device", "auto");
     cfg.threads = std::stoi(Param("threads", "0"));

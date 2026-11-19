@@ -40,6 +40,9 @@ bool Encode(int device, const int32_t* sym, size_t n, XType t, int level, std::v
 // Symbols already in device memory (device 1 = HIP). No host copy of the symbols is made.
 bool EncodeDevice(int device, const int32_t* d_sym, size_t n, XType t, int level, std::vector<uint8_t>& out);
 bool Decode(int device, const uint8_t* b, size_t nb, int32_t* out, size_t n, XType t, int level);
+// Decode on the device and leave the symbols there (pointer valid until the next call of this stage on
+// that device); nullptr when not possible (CPU device, MGARD-X unavailable, failure).
+const int32_t* DecodeDevice(int device, const uint8_t* b, size_t nb, size_t n, XType t, int level);
 // Loads the device kernels and allocates the MGARD-X workspace once per process per (device, type) so the
 // first real stream does not pay for it. No-op on the CPU and when MGARD-X is unavailable.
 void Warmup(int device, XType t);

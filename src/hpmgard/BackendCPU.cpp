@@ -45,6 +45,7 @@ public:
 }
 
 std::unique_ptr<Backend> MakeHipBackend();   // BackendHIP.hip (nullptr when not built or no device)
+std::unique_ptr<Backend> MakeCudaBackend();  // BackendCUDA.cu (nullptr when not built or no device)
 
 DeviceType ParseDevice(const std::string& in) {
     std::string s; for (char c : in) s += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -64,18 +65,22 @@ const char* DeviceName(DeviceType t) { return t == DeviceType::CPU ? "cpu" : t =
 bool DeviceAvailable(DeviceType t) {
     if (t == DeviceType::CPU) return true;
     if (t == DeviceType::HIP) { auto b = MakeHipBackend(); return b != nullptr; }
-    return false;   // CUDA backend not built yet
+    if (t == DeviceType::CUDA) { auto b = MakeCudaBackend(); return b != nullptr; }
+    return false;
 }
 
 std::unique_ptr<Backend> MakeBackend(const std::string& requested) {
     const DeviceType t = ParseDevice(requested);
     if (t == DeviceType::HIP) { auto b = MakeHipBackend(); if (!b) throw std::runtime_error("HIP backend requested but not available (not built or no device)"); return b; }
-    if (t == DeviceType::CUDA) throw std::runtime_error("CUDA backend not implemented yet");
+    if (t == DeviceType::CUDA) { auto b = MakeCudaBackend(); if (!b) throw std::runtime_error("CUDA backend requested but not available (not built or no device)"); return b; }
     return std::unique_ptr<Backend>(new CpuBackend());
 }
 
 #ifndef HPMGARD_HAVE_HIP
 std::unique_ptr<Backend> MakeHipBackend() { return nullptr; }
+#endif
+#ifndef HPMGARD_HAVE_CUDA
+std::unique_ptr<Backend> MakeCudaBackend() { return nullptr; }
 #endif
 
 } // namespace hpmgard

@@ -7,6 +7,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,17 @@ void ZstdDecode(const uint8_t* b, size_t nb, uint8_t* out, size_t n);
 std::vector<uint8_t> EncodeSymbols(const int32_t* sym, size_t n, const std::vector<Stage>& chain, double eb_info = 0.0, int device = 0, const int32_t* d_sym = nullptr);
 // Loads kernels / allocates the MGARD-X workspace for a device-capable first stage (no-op otherwise).
 void WarmupStage(const Stage& first, int device);
+// Device the MGARD-X stages actually use for `device` (0 when MGARD-X is unavailable or fails its preflight there).
+int MgardXDevice(int device);
+// Default chains: "xhuff|zstd:3" where the MGARD-X stages run on a GPU, "huffman|zstd:3" otherwise.
+std::string DefaultChain(int device);
+std::string DefaultTuneCodecs(int device);
+// Device-resident symbols: codes straight from device memory when the first stage can, otherwise fetches the
+// host copy through `host()` (called at most once) and codes it like EncodeSymbols.
+std::vector<uint8_t> EncodeSymbolsDevice(const int32_t* d_sym, size_t n, const std::vector<Stage>& chain, double eb_info, int device, const std::function<const int32_t*()>& host);
+// Decodes a stream onto the device when its first stage can (MGARD-X stage, GPU device); returns the device
+// pointer (valid until the next codec call) and the symbol count, or nullptr when the host path must be used.
+const int32_t* DecodeSymbolsToDevice(const uint8_t* b, size_t nb, size_t& n_out, int device);
 // Returns the number of symbols decoded (== the count written by EncodeSymbols).
 size_t DecodeSymbols(const uint8_t* b, size_t nb, std::vector<int32_t>& out, int device = 0);
 // Whether a first stage can run (e.g. xhuff needs MGARD-X, and a HIP device for device 1).

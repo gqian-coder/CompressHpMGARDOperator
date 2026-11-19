@@ -1,10 +1,9 @@
-// Dispatcher of the MGARD-X lossless stage: zigzag mapping (host path), dictionary guard, device selection,
-// payload header (dict, block), warm-up bookkeeping.
+// Dispatcher of the MGARD-X lossless stage: zigzag mapping (host path), dictionary guard, device selection
+// (0 SERIAL, 1 HIP, 2 CUDA), payload header (dict, block), warm-up bookkeeping.
 #include "hpmgard/codec/MgardXHuff.h"
 #include <algorithm>
 #include <mutex>
 #include <set>
-#include <utility>
 #include <vector>
 
 namespace hpmgard {
@@ -15,13 +14,21 @@ namespace xhuff {
 bool EncodeSerial(const std::vector<int32_t>& codes, XType t, int level, uint32_t dict, uint32_t block, std::vector<uint8_t>& out);
 bool DecodeSerial(const uint8_t* b, size_t nb, std::vector<int32_t>& codes, size_t n, XType t, int level, uint32_t dict, uint32_t block);
 #endif
+// GPU translation units (MgardXHuffDevice.inc), one namespace per device type
+#define HPM_XDEV_DECLS \
+    bool DevicePresent(); \
+    bool Encode(const std::vector<int32_t>& codes, XType t, int level, uint32_t dict, uint32_t block, std::vector<uint8_t>& out); \
+    bool EncodeDevice(const int32_t* d_sym, size_t n, XType t, int level, uint32_t dict, uint32_t block, std::vector<uint8_t>& out); \
+    bool Decode(const uint8_t* b, size_t nb, std::vector<int32_t>& codes, size_t n, XType t, int level, uint32_t dict, uint32_t block); \
+    const int32_t* DecodeDevice(const uint8_t* b, size_t nb, size_t n, XType t, int level, uint32_t dict, uint32_t block); \
+    void Warmup(XType t, int level);
 #ifdef HPMGARD_HAVE_HIP
-bool HipDevicePresent();
-bool EncodeHip(const std::vector<int32_t>& codes, XType t, int level, uint32_t dict, uint32_t block, std::vector<uint8_t>& out);
-bool EncodeHipDevice(const int32_t* d_sym, size_t n, XType t, int level, uint32_t dict, uint32_t block, std::vector<uint8_t>& out);
-bool DecodeHip(const uint8_t* b, size_t nb, std::vector<int32_t>& codes, size_t n, XType t, int level, uint32_t dict, uint32_t block);
-void WarmupHip(XType t, int level);
+namespace hip { HPM_XDEV_DECLS }
 #endif
+#ifdef HPMGARD_HAVE_CUDA
+namespace cuda { HPM_XDEV_DECLS }
+#endif
+#undef HPM_XDEV_DECLS
 
 const char* XTypeName(XType t) {
     switch (t) {
@@ -55,10 +62,14 @@ bool AlphabetOk(XType t, uint32_t zmin, uint32_t zmax) {
 bool Available(int device) {
 #ifdef HPMGARD_HAVE_MGARDX
     if (device == 0) return true;
+#if defined(HPMGARD_HAVE_HIP)
+    if (device == 1) return hip::DevicePresent();
 #endif
-#if defined(HPMGARD_HAVE_MGARDX) && defined(HPMGARD_HAVE_HIP)
-    if (device == 1) return HipDevicePresent();
+#if defined(HPMGARD_HAVE_CUDA)
+    if (device == 2) return cuda::DevicePresent();
 #endif
+#endif
+    (void)device;
     return false;
 }
 
@@ -76,14 +87,14 @@ bool Encode(int device, const int32_t* sym, size_t n, XType t, int level, std::v
     if (!AlphabetOk(t, zmin, zmax)) return false;
     std::vector<uint8_t> x;
     bool ok = false;
-#if defined(HPMGARD_HAVE_MGARDX) && defined(HPMGARD_HAVE_HIP)
-    if (device == 1) ok = EncodeHip(codes, t, level, dict, block, x);
-    else
-#endif
 #ifdef HPMGARD_HAVE_MGARDX
+#if defined(HPMGARD_HAVE_HIP)
+    if (device == 1) ok = hip::Encode(codes, t, level, dict, block, x); else
+#endif
+#if defined(HPMGARD_HAVE_CUDA)
+    if (device == 2) ok = cuda::Encode(codes, t, level, dict, block, x); else
+#endif
     ok = EncodeSerial(codes, t, level, dict, block, x);
-#else
-    ok = false;
 #endif
     if (!ok) return false;
     Finish(out, dict, block, x);
@@ -91,17 +102,18 @@ bool Encode(int device, const int32_t* sym, size_t n, XType t, int level, std::v
 }
 
 bool EncodeDevice(int device, const int32_t* d_sym, size_t n, XType t, int level, std::vector<uint8_t>& out) {
-    if (!d_sym || n < kMinSymbols) return false;
+    if (!d_sym || n < kMinSymbols || !Available(device)) return false;
+    std::vector<uint8_t> x; bool ok = false;
 #if defined(HPMGARD_HAVE_MGARDX) && defined(HPMGARD_HAVE_HIP)
-    if (device == 1 && Available(1)) {
-        std::vector<uint8_t> x;
-        if (!EncodeHipDevice(d_sym, n, t, level, DictSize(), BlockSize(), x)) return false;
-        Finish(out, DictSize(), BlockSize(), x);
-        return true;
-    }
+    if (device == 1) ok = hip::EncodeDevice(d_sym, n, t, level, DictSize(), BlockSize(), x);
 #endif
-    (void)device; (void)t; (void)level; (void)out;
-    return false;
+#if defined(HPMGARD_HAVE_MGARDX) && defined(HPMGARD_HAVE_CUDA)
+    if (device == 2) ok = cuda::EncodeDevice(d_sym, n, t, level, DictSize(), BlockSize(), x);
+#endif
+    (void)t; (void)level;
+    if (!ok) return false;
+    Finish(out, DictSize(), BlockSize(), x);
+    return true;
 }
 
 bool Decode(int device, const uint8_t* b, size_t nb, int32_t* out, size_t n, XType t, int level) {
@@ -112,7 +124,10 @@ bool Decode(int device, const uint8_t* b, size_t nb, int32_t* out, size_t n, XTy
     std::vector<int32_t> codes;
     bool ok = false;
 #if defined(HPMGARD_HAVE_MGARDX) && defined(HPMGARD_HAVE_HIP)
-    if (device == 1 && Available(1)) ok = DecodeHip(b, nb, codes, n, t, level, dict, block);
+    if (device == 1 && Available(1)) ok = hip::Decode(b, nb, codes, n, t, level, dict, block);
+#endif
+#if defined(HPMGARD_HAVE_MGARDX) && defined(HPMGARD_HAVE_CUDA)
+    if (device == 2 && Available(2)) ok = cuda::Decode(b, nb, codes, n, t, level, dict, block);
 #endif
 #ifdef HPMGARD_HAVE_MGARDX
     if (!ok) ok = DecodeSerial(b, nb, codes, n, t, level, dict, block);   // any backend decodes any stream
@@ -123,15 +138,30 @@ bool Decode(int device, const uint8_t* b, size_t nb, int32_t* out, size_t n, XTy
     return true;
 }
 
-void Warmup(int device, XType t) {
+const int32_t* DecodeDevice(int device, const uint8_t* b, size_t nb, size_t n, XType t, int level) {
+    if (n == 0 || nb < 8 || !Available(device) || device == 0) return nullptr;
+    const uint32_t dict = GetU32(b), block = GetU32(b + 4);
+    b += 8; nb -= 8;
 #if defined(HPMGARD_HAVE_MGARDX) && defined(HPMGARD_HAVE_HIP)
-    if (device != 1 || !Available(1)) return;
+    if (device == 1) return hip::DecodeDevice(b, nb, n, t, level, dict, block);
+#endif
+#if defined(HPMGARD_HAVE_MGARDX) && defined(HPMGARD_HAVE_CUDA)
+    if (device == 2) return cuda::DecodeDevice(b, nb, n, t, level, dict, block);
+#endif
+    (void)t; (void)level; (void)dict; (void)block;
+    return nullptr;
+}
+
+void Warmup(int device, XType t) {
+    if (device == 0 || !Available(device)) return;
     static std::mutex m; static std::set<int> done;
     std::lock_guard<std::mutex> lk(m);
-    if (!done.insert(static_cast<int>(t)).second) return;
-    WarmupHip(t, 3);
-#else
-    (void)device; (void)t;
+    if (!done.insert(device * 16 + static_cast<int>(t)).second) return;
+#if defined(HPMGARD_HAVE_MGARDX) && defined(HPMGARD_HAVE_HIP)
+    if (device == 1) hip::Warmup(t, 3);
+#endif
+#if defined(HPMGARD_HAVE_MGARDX) && defined(HPMGARD_HAVE_CUDA)
+    if (device == 2) cuda::Warmup(t, 3);
 #endif
 }
 

@@ -1,5 +1,6 @@
 #include "hpmgard/Tuner.h"
 #include "hpmgard/Backend.h"
+#include "hpmgard/codec/Codec.h"
 #include "hpmgard/Compressor.h"
 #include "hpmgard/MgardX.h"
 #include <algorithm>
@@ -72,8 +73,9 @@ CompressConfig Tune(const FieldView& field, const CompressConfig& cfg_in, const 
             rep << "  " << label << ": " << r.stats.compressed_bytes << " bytes\n";
         } catch (const std::exception& e) { rep << "  " << label << ": failed (" << e.what() << ")\n"; }
     };
-    const std::vector<std::string> codecs = SplitList(cfg.tune_codecs);
-    const std::string codec0 = codecs.empty() ? cfg.residual_codec : codecs[0];
+    const int tune_dev = static_cast<int>(MakeBackend(cfg.device)->type());
+    const std::vector<std::string> codecs = SplitList(cfg.tune_codecs == "auto" ? codec::DefaultTuneCodecs(tune_dev) : cfg.tune_codecs);
+    const std::string codec0 = codecs.empty() ? (cfg.residual_codec == "auto" ? codec::DefaultChain(tune_dev) : cfg.residual_codec) : codecs[0];
     // pass 1: hierarchy and base split at two base quanta, first codec
     std::vector<int> orders{0, 1};
     if (cfg.p >= 3) orders.push_back(2);

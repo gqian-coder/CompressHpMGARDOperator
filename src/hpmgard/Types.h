@@ -85,13 +85,15 @@ struct CompressConfig {
     // quantum does not enter the error bound; it only trades base bytes against residual bytes.
     double base_quantum_ratio = 0.5;         // base quantum = 2 * ratio * tol_abs
     // --- codecs (chain specs, e.g. "huffman|zstd:3", "frbp", "raw|zstd:19", "mgardx") ---
-    std::string base_codec = "huffman|zstd:3";
-    std::string residual_codec = "huffman|zstd:3";
+    // "auto" = "xhuff|zstd:3" (MGARD-X Huffman on the GPU + zstd) when compressing on a GPU where MGARD-X
+    // works, "huffman|zstd:3" (in-house Huffman + zstd) otherwise; any chain spec can be given instead.
+    std::string base_codec = "auto";
+    std::string residual_codec = "auto";
     bool direct_mgardx = false;              // compress the whole component with MGARD-X 1-D instead
     // --- tuner ---
     bool tune = false;
     double tune_sample = 0.03;
-    std::string tune_codecs = "huffman|zstd:3,raw|zstd:3,frbp|zstd:3";
+    std::string tune_codecs = "auto";   // GPU: xhuff|zstd:3,huffman|zstd:3,raw|zstd:3; CPU: huffman|zstd:3,raw|zstd:3,frbp|zstd:3
     bool allow_mgardx_direct = true;
     // --- runtime ---
     std::string device = "auto";          // auto | cpu | hip | cuda (backend for the numeric stages)

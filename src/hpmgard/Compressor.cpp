@@ -24,18 +24,16 @@ namespace {
 using Clock = std::chrono::steady_clock;
 inline double Sec(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double>(b - a).count(); }
 
-// Gather one component of an interleaved block into a contiguous array.
-void ExtractComponent(const FieldView& f, int c, std::vector<double>& out) {
+// Gather one component of an interleaved block into a contiguous array (out: npts values).
+void ExtractComponent(const FieldView& f, int c, double* out) {
     const size_t npts = f.ncells * static_cast<size_t>(f.nsp);
-    out.resize(npts);
-    if (f.ncomp == 1) { std::memcpy(out.data(), f.data, npts * sizeof(double)); return; }
+    if (f.ncomp == 1) { std::memcpy(out, f.data, npts * sizeof(double)); return; }
 #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < npts; ++i) out[i] = f.data[i * f.ncomp + c];
 }
 
-void InsertComponent(const std::vector<double>& in, int c, int ncomp, double* out) {
-    const size_t npts = in.size();
-    if (ncomp == 1) { std::memcpy(out, in.data(), npts * sizeof(double)); return; }
+void InsertComponent(const double* in, size_t npts, int c, int ncomp, double* out) {
+    if (ncomp == 1) { std::memcpy(out, in, npts * sizeof(double)); return; }
 #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < npts; ++i) out[i * ncomp + c] = in[i];
 }
@@ -49,11 +47,12 @@ struct Payload {
     }
 };
 
-std::vector<uint8_t> DoublesToBytes(const std::vector<double>& v) {
-    std::vector<uint8_t> b(v.size() * 8);
-    std::memcpy(b.data(), v.data(), b.size());
+std::vector<uint8_t> DoublesToBytes(const double* v, size_t n) {
+    std::vector<uint8_t> b(n * 8);
+    std::memcpy(b.data(), v, b.size());
     return b;
 }
+std::vector<uint8_t> DoublesToBytes(const std::vector<double>& v) { return DoublesToBytes(v.data(), v.size()); }
 
 } // namespace
 
@@ -132,6 +131,9 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
         if (!ok) cfg.base_method = BaseMethod::CellAvg;   // dedup needs corner geometry and a p1 closed base
     }
     std::unique_ptr<Backend> be = MakeBackend(cfg.device);
+    const int dev = static_cast<int>(be->type());
+    if (cfg.base_codec == "auto") cfg.base_codec = codec::DefaultChain(dev);
+    if (cfg.residual_codec == "auto") cfg.residual_codec = codec::DefaultChain(dev);
     if (cfg.direct_mgardx && !mgardx::DeviceWorks(static_cast<int>(be->type()))) {
         if (cfg.verbose) std::cerr << "[hpmgard] direct MGARD-X requested but MGARD-X does not work on device " << be->name() << "; using the p-split path\n";
         cfg.direct_mgardx = false;
@@ -182,8 +184,14 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
     }
 
     Payload pay;
-    std::vector<double> u, base, base_dec, avg, rem;
+    std::vector<double> avg, rem;
     std::vector<int32_t> k;
+    // component arrays that cross the host-device link live in backend scratch (pinned on GPU backends)
+    double* u = HostArray<double>(*be, Backend::SlotU, npts);
+    int32_t* kres = HostArray<int32_t>(*be, Backend::SlotK, npts);
+    const size_t nbase_max = refactor ? field.ncells * static_cast<size_t>(ops.nsp_base) : 0;
+    double* base = refactor ? HostArray<double>(*be, Backend::SlotBase, nbase_max) : nullptr;
+    double* base_dec = refactor ? HostArray<double>(*be, Backend::SlotBaseDec, nbase_max) : nullptr;
     for (int c = 0; c < field.ncomp; ++c) {
         const auto tc0 = Clock::now();
         ExtractComponent(field, c, u);
@@ -197,7 +205,7 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
             continue;
         }
         if (!(tol > 0.0) || !std::isfinite(tol)) {
-            pay.add(c, StreamKind::RawDoubles, StreamCodec::RawDoubles, npts, DoublesToBytes(u));
+            pay.add(c, StreamKind::RawDoubles, StreamCodec::RawDoubles, npts, DoublesToBytes(u, npts));
             st.streams.push_back({c, StreamKind::RawDoubles, "raw", npts, npts * 8});
             continue;
         }
@@ -205,30 +213,32 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
         h.residual_quantum[c] = qres;
         if (!refactor) {
             const auto tm = Clock::now();
-            std::vector<uint8_t> b = mgardx::Compress1D(u.data(), npts, tol, std::numeric_limits<double>::infinity(), 0, static_cast<int>(be->type()));
+            std::vector<uint8_t> b = mgardx::Compress1D(u, npts, tol, std::numeric_limits<double>::infinity(), 0, static_cast<int>(be->type()));
             st.t_code += Sec(tm, Clock::now());
             pay.add(c, StreamKind::Direct, StreamCodec::MgardX, npts, b);
             st.streams.push_back({c, StreamKind::Direct, "mgardx", npts, b.size()});
             continue;
         }
         // --- base ---
-        struct Session { Backend& b; Session(Backend& be, const double* u, size_t n) : b(be) { b.BeginComponent(u, n); } ~Session() { b.EndComponent(); } } session(*be, u.data(), npts);
+        struct Session { Backend& b; Session(Backend& be, const double* u, size_t n) : b(be) { b.BeginComponent(u, n); } ~Session() { b.EndComponent(); } } session(*be, u, npts);
         const auto tr = Clock::now();
-        const size_t nbase = field.ncells * static_cast<size_t>(ops.nsp_base);
-        base.resize(nbase);
-        be->Restrict(ops, u.data(), field.ncells, base.data());
+        const size_t nbase = nbase_max;
+        be->Restrict(ops, u, field.ncells, base);
         st.t_refactor += Sec(tr, Clock::now());
         const auto tb = Clock::now();
         const double qb = 2.0 * cfg.base_quantum_ratio * tol;
         h.base_quantum[c] = qb;
-        base_dec.assign(nbase, 0.0);
+        std::fill(base_dec, base_dec + nbase, 0.0);
         const int nb = ops.nsp_base;
-        auto code_symbols = [&](const std::vector<int32_t>& syms, StreamKind kind, const std::vector<codec::Stage>& chain, double q, const int32_t* d_syms = nullptr) {
+        auto record = [&](StreamKind kind, const std::vector<codec::Stage>& chain, size_t count, const std::vector<uint8_t>& b) {
+            pay.add(c, kind, StreamCodec::SymbolChain, count, b);
+            st.streams.push_back({c, kind, codec::ChainString(chain), count, b.size()});
+        };
+        auto code_symbols = [&](const std::vector<int32_t>& syms, StreamKind kind, const std::vector<codec::Stage>& chain, double q) {
             const auto tk = Clock::now();
-            std::vector<uint8_t> b = codec::EncodeSymbols(syms.data(), syms.size(), chain, q, static_cast<int>(be->type()), d_syms);
+            std::vector<uint8_t> b = codec::EncodeSymbols(syms.data(), syms.size(), chain, q, dev);
             st.t_code += Sec(tk, Clock::now());
-            pay.add(c, kind, StreamCodec::SymbolChain, syms.size(), b);
-            st.streams.push_back({c, kind, codec::ChainString(chain), syms.size(), b.size()});
+            record(kind, chain, syms.size(), b);
         };
         auto code_doubles_mgardx = [&](const std::vector<double>& vals, StreamKind kind, double abs_tol, std::vector<double>& dec) {
             const auto tk = Clock::now();
@@ -240,14 +250,14 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
         };
         bool base_ok = true;
         if (cfg.base_method == BaseMethod::Plain) {
-            if (base_mgardx) { code_doubles_mgardx(base, StreamKind::Avg, qb / 2.0, base_dec); }
+            if (base_mgardx) { std::vector<double> bv(base, base + nbase), bd; code_doubles_mgardx(bv, StreamKind::Avg, qb / 2.0, bd); std::copy(bd.begin(), bd.end(), base_dec); }
             else {
-                k.resize(base.size()); base_ok = be->Quantize(base.data(), base.size(), qb, k.data());
+                k.resize(nbase); base_ok = be->Quantize(base, nbase, qb, k.data());
                 if (base_ok) { code_symbols(k, StreamKind::Avg, base_chain, qb); for (size_t i = 0; i < nbase; ++i) base_dec[i] = k[i] * qb; }
             }
         } else if (cfg.base_method == BaseMethod::CellAvg) {
             avg.resize(field.ncells);
-            be->CellMeans(base.data(), field.ncells, nb, avg.data());
+            be->CellMeans(base, field.ncells, nb, avg.data());
             std::vector<double> avg_dec;
             if (base_mgardx) code_doubles_mgardx(avg, StreamKind::Avg, qb / 2.0, avg_dec);
             else {
@@ -294,23 +304,31 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
         if (!base_ok) {
             // base quantiser overflow: store the component raw (keeps the bound trivially)
             pay.dir.erase(std::remove_if(pay.dir.begin(), pay.dir.end(), [&](const StreamRec& r) { return r.component == c; }), pay.dir.end());
-            pay.add(c, StreamKind::RawDoubles, StreamCodec::RawDoubles, npts, DoublesToBytes(u));
+            pay.add(c, StreamKind::RawDoubles, StreamCodec::RawDoubles, npts, DoublesToBytes(u, npts));
             st.streams.push_back({c, StreamKind::RawDoubles, "raw", npts, npts * 8});
             continue;
         }
         st.t_base += Sec(tb, Clock::now());
         // --- residual against the decoded base (closed loop) ---
         const auto tq = Clock::now();
-        k.resize(npts);
-        const bool res_ok = be->ResidualFromBase(ops, base_dec.data(), field.ncells, qres, k.data(), u.data());
+        // the symbols stay on the device when a device-capable first stage will code them there
+        const bool keep_on_device = be->KeepsDeviceSymbols() && codec::IsMgardXStage(res_chain[0].id) && codec::MgardXDevice(dev) != 0;
+        const bool res_ok = be->ResidualFromBase(ops, base_dec, field.ncells, qres, keep_on_device ? nullptr : kres, u);
         st.t_residual += Sec(tq, Clock::now());
         if (!res_ok) {
             pay.dir.erase(std::remove_if(pay.dir.begin(), pay.dir.end(), [&](const StreamRec& r) { return r.component == c; }), pay.dir.end());
-            pay.add(c, StreamKind::RawDoubles, StreamCodec::RawDoubles, npts, DoublesToBytes(u));
+            pay.add(c, StreamKind::RawDoubles, StreamCodec::RawDoubles, npts, DoublesToBytes(u, npts));
             st.streams.push_back({c, StreamKind::RawDoubles, "raw", npts, npts * 8});
             continue;
         }
-        code_symbols(k, StreamKind::Residual, res_chain, qres, be->DeviceSymbols());   // device-resident symbols when the backend has them
+        {
+            const auto tk = Clock::now();
+            std::vector<uint8_t> b = keep_on_device
+                ? codec::EncodeSymbolsDevice(be->DeviceSymbols(), npts, res_chain, qres, dev, [&]() { be->CopySymbolsToHost(kres); return static_cast<const int32_t*>(kres); })
+                : codec::EncodeSymbols(kres, npts, res_chain, qres, dev, be->DeviceSymbols());
+            st.t_code += Sec(tk, Clock::now());
+            record(StreamKind::Residual, res_chain, npts, b);
+        }
         (void)tc0;
     }
     // rebuild the stream list in payload order (raw fallbacks may have reordered the record list)
@@ -342,7 +360,9 @@ void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::ve
     OperatorSet ops; bool have_ops = false;
     DedupGeometry geom; bool have_geom = false;
     std::unique_ptr<Backend> be = MakeBackend(device);
-    std::vector<double> comp(npts), base_dec, avg_dec; std::vector<int32_t> k;
+    const int dev = static_cast<int>(be->type());
+    double* comp = HostArray<double>(*be, Backend::SlotOut, npts);
+    std::vector<double> base_dec, avg_dec; std::vector<int32_t> k;
     for (int c = 0; c < h.ncomp; ++c) {
         // collect this component's streams
         const StreamRec *s_avg = nullptr, *s_rem = nullptr, *s_res = nullptr, *s_other = nullptr;
@@ -352,11 +372,11 @@ void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::ve
             if (s.kind == StreamKind::Avg) s_avg = &s; else if (s.kind == StreamKind::Remainder) s_rem = &s; else if (s.kind == StreamKind::Residual) s_res = &s; else s_other = &s;
         }
         if (s_other) {
-            if (s_other->kind == StreamKind::Const) { double v; std::memcpy(&v, payload + s_other->offset, 8); std::fill(comp.begin(), comp.end(), v); }
-            else if (s_other->kind == StreamKind::RawDoubles) { std::memcpy(comp.data(), payload + s_other->offset, npts * 8); }
-            else if (s_other->kind == StreamKind::Direct) { std::vector<double> d; mgardx::Decompress(payload + s_other->offset, s_other->bytes, d, static_cast<int>(be->type())); if (d.size() != npts) throw std::runtime_error("Decompress: MGARD-X size mismatch"); comp.swap(d); comp.resize(npts); }
+            if (s_other->kind == StreamKind::Const) { double v; std::memcpy(&v, payload + s_other->offset, 8); std::fill(comp, comp + npts, v); }
+            else if (s_other->kind == StreamKind::RawDoubles) { std::memcpy(comp, payload + s_other->offset, npts * 8); }
+            else if (s_other->kind == StreamKind::Direct) { std::vector<double> d; mgardx::Decompress(payload + s_other->offset, s_other->bytes, d, dev); if (d.size() != npts) throw std::runtime_error("Decompress: MGARD-X size mismatch"); std::copy(d.begin(), d.end(), comp); }
             else throw std::runtime_error("Decompress: unknown stream kind");
-            InsertComponent(comp, c, h.ncomp, out.data());
+            InsertComponent(comp, npts, c, h.ncomp, out.data());
             continue;
         }
         if (!s_res) throw std::runtime_error("Decompress: residual stream missing");
@@ -397,10 +417,17 @@ void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::ve
 #pragma omp parallel for schedule(static)
             for (size_t slot = 0; slot < nbase; ++slot) { const uint32_t d = geom.perm[slot]; base_dec[d] = avg_dec[geom.vid[d]] + k[slot] * qb; }
         }
-        codec::DecodeSymbols(payload + s_res->offset, s_res->bytes, k, static_cast<int>(be->type()));
-        if (k.size() != npts) throw std::runtime_error("Decompress: residual count mismatch");
-        be->ReconstructFromBase(ops, base_dec.data(), ncells, k.data(), h.residual_quantum[c], comp.data());
-        InsertComponent(comp, c, h.ncomp, out.data());
+        // residual: decode on the device and reconstruct from the device symbols when the stage allows it
+        size_t nd = 0;
+        const int32_t* d_k = (dev != 0) ? codec::DecodeSymbolsToDevice(payload + s_res->offset, s_res->bytes, nd, dev) : nullptr;
+        if (d_k && nd == npts && be->ReconstructFromDeviceSymbols(ops, base_dec.data(), ncells, d_k, h.residual_quantum[c], comp)) {
+            // reconstructed on the device
+        } else {
+            codec::DecodeSymbols(payload + s_res->offset, s_res->bytes, k, dev);
+            if (k.size() != npts) throw std::runtime_error("Decompress: residual count mismatch");
+            be->ReconstructFromBase(ops, base_dec.data(), ncells, k.data(), h.residual_quantum[c], comp);
+        }
+        InsertComponent(comp, npts, c, h.ncomp, out.data());
     }
 }
 
