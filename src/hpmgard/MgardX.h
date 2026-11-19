@@ -14,6 +14,10 @@ std::vector<uint8_t> Compress1D(const double* data, size_t n, double abs_tol, do
 void Decompress(const uint8_t* b, size_t nb, std::vector<double>& out, int device = 0);
 // MGARD-X version compiled in (0,0,0 when unavailable).
 void Version(int& major, int& minor, int& patch);
+// Preflight: does MGARD-X compress + decompress a small array correctly on this device? Cached per device
+// and per process. False when MGARD-X is unavailable, the backend is not compiled in, or the run fails
+// (e.g. the known MGARD-X HIP failure on Frontier login-node MI210s), so callers can fall back.
+bool DeviceWorks(int device);
 
 } // namespace mgardx
 } // namespace hpmgard

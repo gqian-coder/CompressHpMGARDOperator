@@ -5,6 +5,7 @@
 #include <mgard/mgard-x/RuntimeX/RuntimeX.h>
 #include <mgard/mgard-x/Lossless/Lossless.hpp>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <mutex>
@@ -14,26 +15,37 @@ namespace hpmgard {
 namespace codec {
 namespace xhuff {
 
+// Backend error check after the MGARD-X calls (HIP: hipDeviceSynchronize/hipGetLastError; SERIAL: true).
+// Specialised in each translation unit before Impl<Device> is instantiated.
+template <typename Device> bool DeviceErrorCheck();
+
+// HPMGARD_XHUFF_VERIFY=0 disables the decode-and-compare check after a device encode (default on:
+// MGARD-X's decoder is not robust against a corrupt stream, so a bad encode must be caught here).
+inline bool VerifyEnabled() {
+    static const bool on = [] { const char* e = std::getenv("HPMGARD_XHUFF_VERIFY"); return !(e && e[0] == '0'); }();
+    return on;
+}
+
 template <typename Device>
 struct Impl {
     static void InitOnce() {
         static std::once_flag once;
         std::call_once(once, []() { mgard_x::DeviceRuntime<Device>::Initialize(); });
     }
-    static mgard_x::Config MakeConfig(int zstd_level) {
+    static mgard_x::Config MakeConfig(int zstd_level, uint32_t dict, uint32_t block) {
         mgard_x::Config cfg;
         cfg.lossless = zstd_level > 0 ? mgard_x::lossless_type::Huffman_Zstd : mgard_x::lossless_type::Huffman;
-        cfg.huff_dict_size = kDictSize;
-        cfg.huff_block_size = kBlockSize;
+        cfg.huff_dict_size = dict;
+        cfg.huff_block_size = block;
         cfg.zstd_compress_level = zstd_level > 0 ? zstd_level : 3;
         cfg.estimate_outlier_ratio = 1.0;
         cfg.log_level = 0;
         return cfg;
     }
     // codes: zigzag-mapped, all < kDictSize (checked by the caller)
-    static bool Encode(const std::vector<int32_t>& codes, int zstd_level, std::vector<uint8_t>& out) {
+    static bool Encode(const std::vector<int32_t>& codes, int zstd_level, uint32_t dict, uint32_t block, std::vector<uint8_t>& out) {
         InitOnce();
-        const mgard_x::Config cfg = MakeConfig(zstd_level);
+        const mgard_x::Config cfg = MakeConfig(zstd_level, dict, block);
         const mgard_x::SIZE n = static_cast<mgard_x::SIZE>(codes.size());
         try {
             mgard_x::Array<1, std::int32_t, Device> arr({n});
@@ -43,19 +55,27 @@ struct Impl {
             clc.Compress(arr, comp, 0);
             clc.Serialize(comp, 0);     // required for lossless_type::Huffman (no-op for Huffman_Zstd), as in MGARD-X's Compressor
             mgard_x::DeviceRuntime<Device>::SyncQueue(0);
+            if (!DeviceErrorCheck<Device>()) { std::cerr << "[hpmgard xhuff] device error after MGARD-X lossless compress\n"; return false; }
             const size_t bytes = comp.shape(0);
             const mgard_x::Byte* p = comp.hostCopy(false, 0);
             mgard_x::DeviceRuntime<Device>::SyncQueue(0);
             out.assign(p, p + bytes);
+            if (VerifyEnabled()) {
+                std::vector<int32_t> back;
+                if (!Decode(out.data(), out.size(), back, codes.size(), zstd_level, dict, block) || back != codes) {
+                    std::cerr << "[hpmgard xhuff] MGARD-X lossless stream failed the decode check on this device; using the fallback coder\n";
+                    return false;
+                }
+            }
             return true;
         } catch (const std::exception& e) {
             std::cerr << "[hpmgard xhuff] MGARD-X lossless compress failed: " << e.what() << "\n";
             return false;
         }
     }
-    static bool Decode(const uint8_t* b, size_t nb, std::vector<int32_t>& codes, size_t n, int zstd_level) {
+    static bool Decode(const uint8_t* b, size_t nb, std::vector<int32_t>& codes, size_t n, int zstd_level, uint32_t dict, uint32_t block) {
         InitOnce();
-        const mgard_x::Config cfg = MakeConfig(zstd_level);
+        const mgard_x::Config cfg = MakeConfig(zstd_level, dict, block);
         try {
             mgard_x::Array<1, mgard_x::Byte, Device> comp({static_cast<mgard_x::SIZE>(nb)});
             comp.load(reinterpret_cast<const mgard_x::Byte*>(b));
@@ -64,6 +84,7 @@ struct Impl {
             clc.Deserialize(comp, 0);   // inverse of Serialize above
             clc.Decompress(comp, dec, 0);
             mgard_x::DeviceRuntime<Device>::SyncQueue(0);
+            if (!DeviceErrorCheck<Device>()) { std::cerr << "[hpmgard xhuff] device error after MGARD-X lossless decompress\n"; return false; }
             const std::int32_t* p = dec.hostCopy(false, 0);
             mgard_x::DeviceRuntime<Device>::SyncQueue(0);
             codes.assign(p, p + n);

@@ -131,8 +131,15 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
                         && cfg.base_order == 1 && IsTensorShape(cfg.shape);
         if (!ok) cfg.base_method = BaseMethod::CellAvg;   // dedup needs corner geometry and a p1 closed base
     }
-    if (cfg.direct_mgardx && !mgardx::Available()) cfg.direct_mgardx = false;
     std::unique_ptr<Backend> be = MakeBackend(cfg.device);
+    if (cfg.direct_mgardx && !mgardx::DeviceWorks(static_cast<int>(be->type()))) {
+        if (cfg.verbose) std::cerr << "[hpmgard] direct MGARD-X requested but MGARD-X does not work on device " << be->name() << "; using the p-split path\n";
+        cfg.direct_mgardx = false;
+    }
+    if (cfg.base_codec == "mgardx" && !mgardx::DeviceWorks(static_cast<int>(be->type()))) {
+        std::cerr << "[hpmgard] base_codec=mgardx but MGARD-X does not work on device " << be->name() << "; using huffman|zstd:3 for the base\n";
+        cfg.base_codec = "huffman|zstd:3";
+    }
     st.used = cfg;
 
     // --- statistics ---------------------------------------------------------------------------------
@@ -168,7 +175,6 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
     }
     const std::vector<codec::Stage> base_chain = (cfg.base_codec == "mgardx") ? std::vector<codec::Stage>{} : codec::ParseChain(cfg.base_codec);
     const bool base_mgardx = (cfg.base_codec == "mgardx");
-    if (base_mgardx && !mgardx::Available()) throw std::invalid_argument("base_codec=mgardx but hpMGARD was built without MGARD-X");
     const std::vector<codec::Stage> res_chain = codec::ParseChain(cfg.residual_codec);
 
     Payload pay;

@@ -1,4 +1,7 @@
 #include "hpmgard/MgardX.h"
+#include <cmath>
+#include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -57,12 +60,31 @@ void Decompress(const uint8_t* b, size_t nb, std::vector<double>& out, int devic
     std::free(dec);
 }
 
+bool DeviceWorks(int device) {
+    static int cache[3] = {-1, -1, -1};
+    if (device < 0 || device > 2) return false;
+    if (cache[device] >= 0) return cache[device] == 1;
+    bool ok = false;
+    try {
+        const size_t n = 4096; std::vector<double> x(n);
+        for (size_t i = 0; i < n; ++i) x[i] = std::sin(0.01 * static_cast<double>(i)) + 1e-3 * static_cast<double>(i % 7);
+        const double tol = 1e-3;
+        const std::vector<uint8_t> b = Compress1D(x.data(), n, tol, std::numeric_limits<double>::infinity(), 0, device);
+        std::vector<double> y; Decompress(b.data(), b.size(), y, device);
+        ok = (y.size() == n);
+        for (size_t i = 0; ok && i < n; ++i) if (!(std::fabs(y[i] - x[i]) <= tol * 1.0001)) ok = false;
+    } catch (...) { ok = false; }
+    cache[device] = ok ? 1 : 0;
+    return ok;
+}
+
 #else
 
 bool Available() { return false; }
 void Version(int& major, int& minor, int& patch) { major = minor = patch = 0; }
 std::vector<uint8_t> Compress1D(const double*, size_t, double, double, int, int) { throw std::runtime_error("hpMGARD was built without MGARD-X"); }
 void Decompress(const uint8_t*, size_t, std::vector<double>&, int) { throw std::runtime_error("hpMGARD was built without MGARD-X"); }
+bool DeviceWorks(int) { return false; }
 
 #endif
 

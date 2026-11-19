@@ -1,4 +1,5 @@
 #include "hpmgard/Tuner.h"
+#include "hpmgard/Backend.h"
 #include "hpmgard/Compressor.h"
 #include "hpmgard/MgardX.h"
 #include <algorithm>
@@ -108,7 +109,9 @@ CompressConfig Tune(const FieldView& field, const CompressConfig& cfg_in, const 
         CompressConfig c = best; c.base_codec = codecs[i]; c.residual_codec = codecs[i];
         eval(c, "codec " + codecs[i]);
     }
-    if (mgardx::Available()) {
+    const bool mgardx_ok = mgardx::Available() && mgardx::DeviceWorks(static_cast<int>(MakeBackend(cfg.device)->type()));
+    if (!mgardx_ok && mgardx::Available()) rep << "  mgardx candidates skipped: MGARD-X does not work on this device\n";
+    if (mgardx_ok) {
         CompressConfig c = best; c.base_codec = "mgardx";
         eval(c, "base codec mgardx");
     }
@@ -116,7 +119,7 @@ CompressConfig Tune(const FieldView& field, const CompressConfig& cfg_in, const 
     best = best_it->cfg;
     uint64_t best_bytes = best_it->bytes;
     // safety net: direct MGARD-X on the whole sample
-    if (cfg.allow_mgardx_direct && mgardx::Available()) {
+    if (cfg.allow_mgardx_direct && mgardx_ok) {
         CompressConfig c = best; c.direct_mgardx = true;
         try {
             CompressResult r = Compress(smp.view, c, smesh, meta);
