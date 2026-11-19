@@ -176,6 +176,10 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
     const std::vector<codec::Stage> base_chain = (cfg.base_codec == "mgardx") ? std::vector<codec::Stage>{} : codec::ParseChain(cfg.base_codec);
     const bool base_mgardx = (cfg.base_codec == "mgardx");
     const std::vector<codec::Stage> res_chain = codec::ParseChain(cfg.residual_codec);
+    if (be->type() != DeviceType::CPU) {       // device-capable first stages: load kernels / workspace once per process
+        if (!base_chain.empty()) codec::WarmupStage(base_chain[0], static_cast<int>(be->type()));
+        codec::WarmupStage(res_chain[0], static_cast<int>(be->type()));
+    }
 
     Payload pay;
     std::vector<double> u, base, base_dec, avg, rem;
@@ -219,9 +223,9 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
         h.base_quantum[c] = qb;
         base_dec.assign(nbase, 0.0);
         const int nb = ops.nsp_base;
-        auto code_symbols = [&](const std::vector<int32_t>& syms, StreamKind kind, const std::vector<codec::Stage>& chain, double q) {
+        auto code_symbols = [&](const std::vector<int32_t>& syms, StreamKind kind, const std::vector<codec::Stage>& chain, double q, const int32_t* d_syms = nullptr) {
             const auto tk = Clock::now();
-            std::vector<uint8_t> b = codec::EncodeSymbols(syms.data(), syms.size(), chain, q, static_cast<int>(be->type()));
+            std::vector<uint8_t> b = codec::EncodeSymbols(syms.data(), syms.size(), chain, q, static_cast<int>(be->type()), d_syms);
             st.t_code += Sec(tk, Clock::now());
             pay.add(c, kind, StreamCodec::SymbolChain, syms.size(), b);
             st.streams.push_back({c, kind, codec::ChainString(chain), syms.size(), b.size()});
@@ -306,7 +310,7 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
             st.streams.push_back({c, StreamKind::RawDoubles, "raw", npts, npts * 8});
             continue;
         }
-        code_symbols(k, StreamKind::Residual, res_chain, qres);
+        code_symbols(k, StreamKind::Residual, res_chain, qres, be->DeviceSymbols());   // device-resident symbols when the backend has them
         (void)tc0;
     }
     // rebuild the stream list in payload order (raw fallbacks may have reordered the record list)

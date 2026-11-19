@@ -35,6 +35,10 @@ public:
     // pointer reuse the device copy. CPU backend: no-op.
     virtual void BeginComponent(const double* /*u*/, size_t /*npts*/) {}
     virtual void EndComponent() {}
+    // Device pointer to the quantised symbols produced by the last ResidualFromBase/Quantize call (valid
+    // until the next call on this backend); nullptr on the CPU. Lets a device-capable codec code them
+    // without a host round trip.
+    virtual const int32_t* DeviceSymbols() const { return nullptr; }
     // k = rint((u - P base_dec) / q) without materialising P base_dec on the host (same overflow rule).
     virtual bool ResidualFromBase(const OperatorSet& ops, const double* base_dec, size_t ncells, double q, int32_t* k, const double* u) {
         std::vector<double> ub(ncells * static_cast<size_t>(ops.nsp_data));

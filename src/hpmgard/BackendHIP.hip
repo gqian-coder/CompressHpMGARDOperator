@@ -88,7 +88,8 @@ public:
         HPM_HIP_CHECK(hipMemcpy(d_u_.p, u, npts * 8, hipMemcpyHostToDevice));
         resident_ = u; resident_n_ = npts;
     }
-    void EndComponent() override { resident_ = nullptr; resident_n_ = 0; }
+    void EndComponent() override { resident_ = nullptr; resident_n_ = 0; d_k_n_ = 0; }
+    const int32_t* DeviceSymbols() const override { return d_k_n_ ? static_cast<const int32_t*>(d_k_.p) : nullptr; }
     void UploadMatrix(const std::vector<double>& full) { d_m_.reserve(full.size() * 8); HPM_HIP_CHECK(hipMemcpy(d_m_.p, full.data(), full.size() * 8, hipMemcpyHostToDevice)); }
     void Launch(const void* d_in, int n_out, int n_in, size_t ncells, void* d_out) {
         const size_t nout = ncells * n_out; const int threads = 256; const size_t blocks = (nout + threads - 1) / threads;
@@ -119,6 +120,7 @@ public:
         HPM_HIP_CHECK(hipGetLastError());
         int overflow = 0; HPM_HIP_CHECK(hipMemcpy(&overflow, d_flag_.p, 4, hipMemcpyDeviceToHost));
         HPM_HIP_CHECK(hipMemcpy(k, d_k_.p, npts * 4, hipMemcpyDeviceToHost));
+        d_k_n_ = npts;
         return overflow == 0;
     }
     void ReconstructFromBase(const OperatorSet& ops, const double* base_dec, size_t ncells, const int32_t* k, double q, double* out) override {
@@ -128,7 +130,7 @@ public:
         d_base_.reserve(nbase * 8); HPM_HIP_CHECK(hipMemcpy(d_base_.p, base_dec, nbase * 8, hipMemcpyHostToDevice));
         d_out_.reserve(npts * 8);
         Launch(d_base_.p, ops.nsp_data, ops.nsp_base, ncells, d_out_.p);
-        d_k_.reserve(npts * 4); HPM_HIP_CHECK(hipMemcpy(d_k_.p, k, npts * 4, hipMemcpyHostToDevice));
+        d_k_.reserve(npts * 4); HPM_HIP_CHECK(hipMemcpy(d_k_.p, k, npts * 4, hipMemcpyHostToDevice)); d_k_n_ = 0;
         const int threads = 256; const size_t blocks = (npts + threads - 1) / threads;
         hipLaunchKernelGGL(DequantizeAddKernel, dim3(blocks), dim3(threads), 0, 0, (const int32_t*)d_k_.p, npts, q, (double*)d_out_.p);
         HPM_HIP_CHECK(hipGetLastError());
@@ -149,13 +151,14 @@ public:
         int overflow = 0;
         HPM_HIP_CHECK(hipMemcpy(&overflow, d_flag_.p, 4, hipMemcpyDeviceToHost));
         HPM_HIP_CHECK(hipMemcpy(k, d_k_.p, n * 4, hipMemcpyDeviceToHost));
+        d_k_n_ = n;
         return overflow == 0;
     }
     bool Quantize(const double* x, size_t n, double q, int32_t* k) override { return QuantizeImpl(x, nullptr, n, q, k); }
     bool ResidualQuantize(const double* u, const double* ub, size_t n, double q, int32_t* k) override { return QuantizeImpl(u, ub, n, q, k); }
     void DequantizeAdd(const int32_t* k, size_t n, double q, double* u) override {
         d_k_.reserve(n * 4); d_in_.reserve(n * 8);
-        HPM_HIP_CHECK(hipMemcpy(d_k_.p, k, n * 4, hipMemcpyHostToDevice)); HPM_HIP_CHECK(hipMemcpy(d_in_.p, u, n * 8, hipMemcpyHostToDevice));
+        HPM_HIP_CHECK(hipMemcpy(d_k_.p, k, n * 4, hipMemcpyHostToDevice)); HPM_HIP_CHECK(hipMemcpy(d_in_.p, u, n * 8, hipMemcpyHostToDevice)); d_k_n_ = 0;
         const int threads = 256; const size_t blocks = (n + threads - 1) / threads;
         hipLaunchKernelGGL(DequantizeAddKernel, dim3(blocks), dim3(threads), 0, 0, (const int32_t*)d_k_.p, n, q, (double*)d_in_.p);
         HPM_HIP_CHECK(hipGetLastError());
@@ -172,6 +175,7 @@ public:
 private:
     DeviceBuffer d_in_, d_out_, d_m_, d_k_, d_flag_, d_u_, d_base_;
     const double* resident_ = nullptr; size_t resident_n_ = 0;
+    size_t d_k_n_ = 0;   // symbols currently valid in d_k_ (see DeviceSymbols)
 };
 
 } // namespace
