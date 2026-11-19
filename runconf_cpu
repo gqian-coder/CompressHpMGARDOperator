@@ -6,6 +6,9 @@
 # Dependencies: OpenMP, libzstd (system or the MGARD prefix), optional MGARD-X (SERIAL build) for the
 # `mgardx` stream codec and the direct-MGARD-X tuner candidate, optional ADIOS2 for the plugin.
 set -e
+# The Cray wrapper auto-links libsci (static TLS: breaks dlopen of the plugin) and darshan (MPI-only);
+# neither is needed, so unload them for the whole configure + build shell.
+if type module >/dev/null 2>&1; then module unload cray-libsci darshan-runtime 2>/dev/null || true; fi
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="${HPMGARD_INSTALL_DIR:-${PROJECT_DIR}/install-cpu}"
 MGARD_DIR="${MGARD_DIR:-/lustre/orion/cfd164/proj-shared/gongq/Software/MGARD-serial/install-serial}"
