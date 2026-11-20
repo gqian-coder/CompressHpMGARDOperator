@@ -1,6 +1,9 @@
 #include "hpmgard/codec/Codec.h"
 #include "hpmgard/Bytes.h"
 #include <zstd.h>
+#include <omp.h>
+#include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 
@@ -76,9 +79,43 @@ void FrbpDecode(const uint8_t* b, size_t nb, int32_t* out, size_t n) {
 }
 
 // ---------------------------------------------------------------- zstd
+namespace {
+// Multithreaded zstd for large inputs: HPMGARD_ZSTD_WORKERS (default min(OpenMP threads, 8); 0 or 1 =
+// single-threaded) and HPMGARD_ZSTD_JOB_MB (default 1, the independent job size; smaller = more parallel
+// jobs, slightly less context for the matcher). Needs libzstd built with ZSTD_MULTITHREAD_SUPPORT; when
+// the worker parameter is rejected the single-threaded path is used.
+int ZstdWorkers() {
+    static const int w = [] {
+        const char* e = std::getenv("HPMGARD_ZSTD_WORKERS");
+        if (e) return std::max(0, std::atoi(e));
+        return std::min(omp_get_max_threads(), 8);
+    }();
+    return w;
+}
+size_t ZstdJobBytes() {
+    static const size_t j = [] { const char* e = std::getenv("HPMGARD_ZSTD_JOB_MB"); const long mb = e ? std::atol(e) : 1; return static_cast<size_t>(std::max(1l, mb)) << 20; }();
+    return j;
+}
+}
+
 std::vector<uint8_t> ZstdEncode(const uint8_t* b, size_t n, int level) {
     std::vector<uint8_t> out(ZSTD_compressBound(n));
-    const size_t c = ZSTD_compress(out.data(), out.size(), b, n, level);
+    size_t c = 0; bool done = false;
+    const int workers = ZstdWorkers();
+    if (workers > 1 && n >= (size_t(1) << 20)) {
+        static thread_local ZSTD_CCtx* cctx = nullptr;   // reused so the worker pool is created once per thread
+        if (!cctx) cctx = ZSTD_createCCtx();
+        if (cctx) {
+            ZSTD_CCtx_reset(cctx, ZSTD_reset_session_and_parameters);
+            ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, level);
+            if (!ZSTD_isError(ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, workers))) {
+                ZSTD_CCtx_setParameter(cctx, ZSTD_c_jobSize, static_cast<int>(std::min<size_t>(ZstdJobBytes(), size_t(1) << 30)));
+                c = ZSTD_compress2(cctx, out.data(), out.size(), b, n);
+                done = !ZSTD_isError(c);
+            }
+        }
+    }
+    if (!done) c = ZSTD_compress(out.data(), out.size(), b, n, level);
     if (ZSTD_isError(c)) throw std::runtime_error(std::string("ZstdEncode: ") + ZSTD_getErrorName(c));
     out.resize(c);
     return out;

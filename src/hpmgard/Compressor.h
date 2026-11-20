@@ -17,6 +17,7 @@ struct CompressStats {
     uint64_t raw_bytes = 0, compressed_bytes = 0, header_bytes = 0;
     std::vector<StreamStat> streams;
     double t_stats = 0, t_refactor = 0, t_base = 0, t_residual = 0, t_code = 0, t_tune = 0, t_total = 0;   // seconds
+    double t_geom = 0;   // dedup geometry build (0 when served from the process-wide cache)
     CompressConfig used;
     std::string tune_report;
     double ratio() const { return compressed_bytes ? double(raw_bytes) / double(compressed_bytes) : 0.0; }

@@ -170,10 +170,10 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
     OperatorSet ops;
     const bool refactor = !cfg.direct_mgardx;
     if (refactor) { ops = BuildOperators(cfg.shape, cfg.p, cfg.base_order, cfg.node_set, cfg.base_rep); h.base_rep = ops.base_rep; h.amp_inf = ops.amp_inf; }
-    DedupGeometry geom;
+    std::shared_ptr<const DedupGeometry> geom_sp; const DedupGeometry* geom = nullptr;
     if (refactor && cfg.base_method == BaseMethod::DedupSfc) {
-        geom = BuildDedupGeometry(*mesh);
-        h.num_vertex_groups = geom.ngroups; h.crc_vid = geom.crc_vid; h.crc_perm = geom.crc_perm; h.corner_perm_code = 1;
+        geom_sp = CachedDedupGeometry(*mesh); geom = geom_sp.get(); st.t_geom = LastGeometryBuildSeconds();
+        h.num_vertex_groups = geom->ngroups; h.crc_vid = geom->crc_vid; h.crc_perm = geom->crc_perm; h.corner_perm_code = 1;
     }
     const std::vector<codec::Stage> base_chain = (cfg.base_codec == "mgardx") ? std::vector<codec::Stage>{} : codec::ParseChain(cfg.base_codec);
     const bool base_mgardx = (cfg.base_codec == "mgardx");
@@ -279,25 +279,25 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
             }
         } else {   // DedupSfc: per-vertex mean + Hilbert-ordered remainder
             const size_t ndof = nbase;   // = ncells * 8
-            avg.assign(geom.ngroups, 0.0);
-            std::vector<uint32_t> cnt(geom.ngroups, 0);
-            for (size_t i = 0; i < ndof; ++i) { avg[geom.vid[i]] += base[i]; ++cnt[geom.vid[i]]; }
-            for (uint32_t g = 0; g < geom.ngroups; ++g) if (cnt[g]) avg[g] /= cnt[g];
+            avg.assign(geom->ngroups, 0.0);
+            std::vector<uint32_t> cnt(geom->ngroups, 0);
+            for (size_t i = 0; i < ndof; ++i) { avg[geom->vid[i]] += base[i]; ++cnt[geom->vid[i]]; }
+            for (uint32_t g = 0; g < geom->ngroups; ++g) if (cnt[g]) avg[g] /= cnt[g];
             std::vector<double> avg_dec;
             if (base_mgardx) code_doubles_mgardx(avg, StreamKind::Avg, qb / 2.0, avg_dec);
             else {
                 k.resize(avg.size()); base_ok = be->Quantize(avg.data(), avg.size(), qb, k.data());
-                if (base_ok) { code_symbols(k, StreamKind::Avg, base_chain, qb); avg_dec.resize(geom.ngroups); for (size_t i = 0; i < geom.ngroups; ++i) avg_dec[i] = k[i] * qb; }
+                if (base_ok) { code_symbols(k, StreamKind::Avg, base_chain, qb); avg_dec.resize(geom->ngroups); for (size_t i = 0; i < geom->ngroups; ++i) avg_dec[i] = k[i] * qb; }
             }
             if (base_ok) {
                 rem.resize(ndof);
 #pragma omp parallel for schedule(static)
-                for (size_t slot = 0; slot < ndof; ++slot) { const uint32_t d = geom.perm[slot]; rem[slot] = base[d] - avg_dec[geom.vid[d]]; }
+                for (size_t slot = 0; slot < ndof; ++slot) { const uint32_t d = geom->perm[slot]; rem[slot] = base[d] - avg_dec[geom->vid[d]]; }
                 k.resize(rem.size()); base_ok = be->Quantize(rem.data(), rem.size(), qb, k.data());
                 if (base_ok) {
                     code_symbols(k, StreamKind::Remainder, res_chain, qb);
 #pragma omp parallel for schedule(static)
-                    for (size_t slot = 0; slot < ndof; ++slot) { const uint32_t d = geom.perm[slot]; base_dec[d] = avg_dec[geom.vid[d]] + k[slot] * qb; }
+                    for (size_t slot = 0; slot < ndof; ++slot) { const uint32_t d = geom->perm[slot]; base_dec[d] = avg_dec[geom->vid[d]] + k[slot] * qb; }
                 }
             }
         }
@@ -342,7 +342,7 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
     st.t_total = Sec(t0, Clock::now());
     if (cfg.verbose) {
         std::cerr << "[hpmgard] block " << meta.blockid << ": " << raw_bytes << " -> " << st.compressed_bytes << " bytes (CR " << st.ratio() << ") in " << st.t_total << " s"
-                  << " [stats " << st.t_stats << " refactor " << st.t_refactor << " base " << st.t_base << " residual " << st.t_residual << " code " << st.t_code << " tune " << st.t_tune << "]\n";
+                  << " [stats " << st.t_stats << " geom " << st.t_geom << " refactor " << st.t_refactor << " base " << st.t_base << " residual " << st.t_residual << " code " << st.t_code << " tune " << st.t_tune << "]\n";
         for (const auto& s : st.streams) std::cerr << "    comp " << s.component << " kind " << static_cast<int>(s.kind) << " " << s.codec << " " << s.count << " values -> " << s.bytes << " bytes\n";
     }
     return res;
@@ -358,7 +358,7 @@ void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::ve
     const uint8_t* payload = bytes + off;
     const size_t payload_bytes = n - off;
     OperatorSet ops; bool have_ops = false;
-    DedupGeometry geom; bool have_geom = false;
+    std::shared_ptr<const DedupGeometry> geom_sp; const DedupGeometry* geom = nullptr; bool have_geom = false;
     std::unique_ptr<Backend> be = MakeBackend(device);
     const int dev = static_cast<int>(be->type());
     double* comp = HostArray<double>(*be, Backend::SlotOut, npts);
@@ -406,8 +406,8 @@ void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::ve
         } else {
             if (!mesh || mesh->empty()) throw std::runtime_error("Decompress: this block was written with dedup_sfc and needs the mesh corners");
             if (!have_geom) {
-                geom = BuildDedupGeometry(*mesh); have_geom = true;
-                if (geom.ngroups != h.num_vertex_groups || geom.crc_vid != h.crc_vid || geom.crc_perm != h.crc_perm)
+                geom_sp = CachedDedupGeometry(*mesh); geom = geom_sp.get(); have_geom = true;
+                if (geom->ngroups != h.num_vertex_groups || geom->crc_vid != h.crc_vid || geom->crc_perm != h.crc_perm)
                     throw std::runtime_error("Decompress: mesh geometry does not match the block (vertex groups or Hilbert order differ)");
             }
             if (!s_avg || !s_rem) throw std::runtime_error("Decompress: dedup streams missing");
@@ -415,7 +415,7 @@ void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::ve
             codec::DecodeSymbols(payload + s_rem->offset, s_rem->bytes, k, static_cast<int>(be->type()));
             if (k.size() != nbase) throw std::runtime_error("Decompress: remainder count mismatch");
 #pragma omp parallel for schedule(static)
-            for (size_t slot = 0; slot < nbase; ++slot) { const uint32_t d = geom.perm[slot]; base_dec[d] = avg_dec[geom.vid[d]] + k[slot] * qb; }
+            for (size_t slot = 0; slot < nbase; ++slot) { const uint32_t d = geom->perm[slot]; base_dec[d] = avg_dec[geom->vid[d]] + k[slot] * qb; }
         }
         // residual: decode on the device and reconstruct from the device symbols when the stage allows it
         size_t nd = 0;
