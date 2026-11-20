@@ -3,6 +3,7 @@
 // hand the quantised residual symbols to a device-capable codec without a host round trip, and give the
 // compressor pinned host scratch for the arrays that cross the PCIe/IF link.
 #pragma once
+#include "hpmgard/BaseSplit.h"
 #include "hpmgard/Operators.h"
 #include "hpmgard/Types.h"
 #include <cstdint>
@@ -45,8 +46,23 @@ public:
     // on this backend); nullptr on the CPU.
     virtual const int32_t* DeviceSymbols() const { return nullptr; }
     virtual void CopySymbolsToHost(int32_t* /*k*/) const {}
+    // ---- device-resident base path (GPU backends) ---------------------------------------------------
+    // Restrict -> split (cell average / dedup / plain) -> quantise -> decoded base, all on the device; the
+    // quantised base streams are exposed as device pointers (valid until the next base call) and the decoded
+    // base stays resident for ResidualFromBase(base_dec == nullptr). False = not supported, use the host path.
+    struct DeviceStreams { const int32_t* d_avg = nullptr; size_t n_avg = 0; const int32_t* d_rem = nullptr; size_t n_rem = 0; };
+    virtual bool SupportsDeviceBase() const { return false; }
+    virtual bool RestrictDevice(const OperatorSet& /*ops*/, size_t /*ncells*/, const double* /*u*/) { return false; }
+    // Returns false on quantiser overflow (caller falls back to raw) or when unsupported.
+    virtual bool SplitCellAvgDevice(size_t /*ncells*/, int /*nb*/, double /*qb*/, DeviceStreams& /*out*/) { return false; }
+    virtual bool SplitDedupDevice(size_t /*ncells*/, int /*nb*/, double /*qb*/, const DedupGeometry& /*geom*/, DeviceStreams& /*out*/) { return false; }
+    virtual bool SplitPlainDevice(size_t /*ncells*/, int /*nb*/, double /*qb*/, DeviceStreams& /*out*/) { return false; }
+    // Copies n symbols from a device pointer returned above to the host (host coders, fallbacks).
+    virtual void CopyDeviceToHost(const int32_t* /*d*/, size_t /*n*/, int32_t* /*host*/) const {}
+
     // k = rint((u - P base_dec) / q) without materialising P base_dec on the host (same overflow rule).
-    // k may be nullptr only when KeepsDeviceSymbols().
+    // k may be nullptr only when KeepsDeviceSymbols(); base_dec may be nullptr after a Split*Device call
+    // (the resident decoded base is used).
     virtual bool ResidualFromBase(const OperatorSet& ops, const double* base_dec, size_t ncells, double q, int32_t* k, const double* u) {
         std::vector<double> ub(ncells * static_cast<size_t>(ops.nsp_data));
         Prolong(ops, base_dec, ncells, ub.data());

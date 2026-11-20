@@ -223,7 +223,11 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
         struct Session { Backend& b; Session(Backend& be, const double* u, size_t n) : b(be) { b.BeginComponent(u, n); } ~Session() { b.EndComponent(); } } session(*be, u, npts);
         const auto tr = Clock::now();
         const size_t nbase = nbase_max;
-        be->Restrict(ops, u, field.ncells, base);
+        // device-resident base path: restrict, split, quantise and decode the base on the device; the base
+        // streams are coded from device memory and the decoded base stays resident for the residual
+        const bool device_base = be->SupportsDeviceBase() && !base_mgardx;
+        if (device_base) be->RestrictDevice(ops, field.ncells, u);
+        else be->Restrict(ops, u, field.ncells, base);
         st.t_refactor += Sec(tr, Clock::now());
         const auto tb = Clock::now();
         const double qb = 2.0 * cfg.base_quantum_ratio * tol;
@@ -249,7 +253,22 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
             st.streams.push_back({c, kind, "mgardx", vals.size(), b.size()});
         };
         bool base_ok = true;
-        if (cfg.base_method == BaseMethod::Plain) {
+        auto code_device_stream = [&](const int32_t* d_syms, size_t n, StreamKind kind, const std::vector<codec::Stage>& chain, double q) {
+            const auto tk = Clock::now();
+            std::vector<uint8_t> b = codec::EncodeSymbolsDevice(d_syms, n, chain, q, dev, [&]() { k.resize(n); be->CopyDeviceToHost(d_syms, n, k.data()); return static_cast<const int32_t*>(k.data()); });
+            st.t_code += Sec(tk, Clock::now());
+            record(kind, chain, n, b);
+        };
+        if (device_base) {
+            Backend::DeviceStreams ds;
+            if (cfg.base_method == BaseMethod::Plain) base_ok = be->SplitPlainDevice(field.ncells, nb, qb, ds);
+            else if (cfg.base_method == BaseMethod::CellAvg) base_ok = be->SplitCellAvgDevice(field.ncells, nb, qb, ds);
+            else base_ok = be->SplitDedupDevice(field.ncells, nb, qb, *geom, ds);
+            if (base_ok) {
+                code_device_stream(ds.d_avg, ds.n_avg, StreamKind::Avg, base_chain, qb);
+                if (ds.n_rem) code_device_stream(ds.d_rem, ds.n_rem, StreamKind::Remainder, res_chain, qb);
+            }
+        } else if (cfg.base_method == BaseMethod::Plain) {
             if (base_mgardx) { std::vector<double> bv(base, base + nbase), bd; code_doubles_mgardx(bv, StreamKind::Avg, qb / 2.0, bd); std::copy(bd.begin(), bd.end(), base_dec); }
             else {
                 k.resize(nbase); base_ok = be->Quantize(base, nbase, qb, k.data());
@@ -313,7 +332,7 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
         const auto tq = Clock::now();
         // the symbols stay on the device when a device-capable first stage will code them there
         const bool keep_on_device = be->KeepsDeviceSymbols() && codec::IsMgardXStage(res_chain[0].id) && codec::MgardXDevice(dev) != 0;
-        const bool res_ok = be->ResidualFromBase(ops, base_dec, field.ncells, qres, keep_on_device ? nullptr : kres, u);
+        const bool res_ok = be->ResidualFromBase(ops, device_base ? nullptr : base_dec, field.ncells, qres, keep_on_device ? nullptr : kres, u);
         st.t_residual += Sec(tq, Clock::now());
         if (!res_ok) {
             pay.dir.erase(std::remove_if(pay.dir.begin(), pay.dir.end(), [&](const StreamRec& r) { return r.component == c; }), pay.dir.end());

@@ -1,6 +1,7 @@
 #include "operator/CompressHpMGARDOperator.h"
 #include "hpmgard/hpmgard.h"
 #include <algorithm>
+#include <map>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -89,7 +90,10 @@ size_t CompressHpMGARDOperator::Operate(const char* dataIn, const Dims& /*blockS
             cfg.abs_tolerance = list; cfg.norm = Norm::Abs;
         }
     }
-    cfg.tune = Lower(Param("tuning", "auto")) != "fixed";
+    // tuning: "once" (default) tunes the first block of this variable and reuses the choice for the later
+    // blocks and steps; "always" tunes every call; "fixed" never tunes
+    const std::string tuning = Lower(Param("tuning", "once"));
+    cfg.tune = tuning != "fixed";
     cfg.tune_sample = std::stod(Param("tuning_sample", "0.03"));
     cfg.tune_codecs = Param("tune_codecs", cfg.tune_codecs);
     cfg.base_order = std::stoi(Param("base_order", "1"));
@@ -137,7 +141,25 @@ size_t CompressHpMGARDOperator::Operate(const char* dataIn, const Dims& /*blockS
         }
     }
     if (cfg.base_method != BaseMethod::DedupSfc) { meta.conn_var.clear(); meta.coords_var.clear(); }
+    // tune once per variable: the tuned hierarchy/split/quantum/codecs are reused for the following blocks and steps
+    struct TunedChoice { int base_order; BaseMethod base_method; double ratio; std::string base_codec, residual_codec; bool direct; };
+    static std::map<std::string, TunedChoice> g_tuned;
+    const std::string tune_key = m_VariableName + "|" + cell_type + "|" + order + "|" + std::to_string(cfg.ncomp) + "|" + std::to_string(static_cast<int>(cfg.norm)) + "|" + Param("tolerance") + "|" + cfg.device + "|" + std::to_string(static_cast<int>(cfg.base_method));
+    const bool tune_once = (tuning == "once" || tuning == "auto") && cfg.tune;
+    if (tune_once) {
+        auto it = g_tuned.find(tune_key);
+        if (it != g_tuned.end()) {
+            cfg.tune = false; cfg.base_order = it->second.base_order; cfg.base_method = it->second.base_method; cfg.base_quantum_ratio = it->second.ratio;
+            cfg.base_codec = it->second.base_codec; cfg.residual_codec = it->second.residual_codec; cfg.direct_mgardx = it->second.direct;
+            if (cfg.base_method != BaseMethod::DedupSfc) { meta.conn_var.clear(); meta.coords_var.clear(); }
+        }
+    }
     CompressResult r = Compress(field, cfg, mesh, meta);
+    if (tune_once && cfg.tune) {
+        const CompressConfig& u = r.stats.used;
+        g_tuned[tune_key] = TunedChoice{u.base_order, u.base_method, u.base_quantum_ratio, u.base_codec, u.residual_codec, u.direct_mgardx};
+        if (cfg.verbose) std::cerr << "[CompressHpMGARDOperator] " << m_VariableName << ": tuned once (base order " << u.base_order << ", codecs " << u.base_codec << "/" << u.residual_codec << "); later blocks and steps reuse it\n";
+    }
     if (r.bytes.size() >= raw_bytes + 1024) {
         // incompressible: store raw
         BlockHeader h = ReadHeader(r.bytes.data(), r.bytes.size()); h.flags = 1; h.streams.clear();

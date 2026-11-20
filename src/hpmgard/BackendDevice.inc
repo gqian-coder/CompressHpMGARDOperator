@@ -155,6 +155,45 @@ __global__ void DequantizeAddKernel(const int32_t* __restrict__ k, size_t n, dou
     if (i < n) u[i] += k[i] * q;
 }
 
+// base split kernels (device-resident base path)
+__global__ void DequantKernel(const int32_t* __restrict__ k, size_t n, double q, double* __restrict__ out) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < n) out[i] = k[i] * q;
+}
+// cell average split: k_rem = rint((base - avg_dec[cell]) / qb), base_dec = avg_dec[cell] + k_rem * qb
+__global__ void CellAvgRemainderKernel(const double* __restrict__ base, const double* __restrict__ avg_dec, size_t nbase, int nb, double qb, double inv_qb,
+                                       int32_t* __restrict__ k, double* __restrict__ base_dec, int* __restrict__ overflow) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nbase) return;
+    const double a = avg_dec[i / nb];
+    const double v = (base[i] - a) * inv_qb;
+    if (!(fabs(v) < kMaxQuantMagnitude)) { atomicOr(overflow, 1); k[i] = 0; base_dec[i] = a; return; }
+    const int32_t kk = static_cast<int32_t>(llrint(v));
+    k[i] = kk; base_dec[i] = a + kk * qb;
+}
+// dedup split: per-vertex sums (atomic; summation order is not deterministic, so the quantised means may
+// differ in rounding ties between runs/backends: both streams are valid), then remainders in Hilbert order
+__global__ void GroupSumKernel(const double* __restrict__ base, const uint32_t* __restrict__ vid, size_t nbase, double* __restrict__ sum) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < nbase) atomicAdd(sum + vid[i], base[i]);
+}
+__global__ void GroupMeanKernel(const double* __restrict__ sum, const uint32_t* __restrict__ cnt, size_t ngroups, double* __restrict__ avg) {
+    const size_t g = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (g < ngroups) avg[g] = cnt[g] ? sum[g] / cnt[g] : 0.0;
+}
+// slot -> d = perm[slot]; k_rem[slot] = rint((base[d] - avg_dec[vid[d]]) / qb); base_dec[d] = avg_dec[vid[d]] + k_rem[slot] * qb
+__global__ void DedupRemainderKernel(const double* __restrict__ base, const double* __restrict__ avg_dec, const uint32_t* __restrict__ vid, const uint32_t* __restrict__ perm,
+                                     size_t nbase, double qb, double inv_qb, int32_t* __restrict__ k, double* __restrict__ base_dec, int* __restrict__ overflow) {
+    const size_t slot = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (slot >= nbase) return;
+    const uint32_t d = perm[slot];
+    const double a = avg_dec[vid[d]];
+    const double v = (base[d] - a) * inv_qb;
+    if (!(fabs(v) < kMaxQuantMagnitude)) { atomicOr(overflow, 1); k[slot] = 0; base_dec[d] = a; return; }
+    const int32_t kk = static_cast<int32_t>(llrint(v));
+    k[slot] = kk; base_dec[d] = a + kk * qb;
+}
+
 __global__ void CellMeansKernel(const double* __restrict__ base, size_t ncells, int nb, double* __restrict__ avg) {
     const size_t c = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (c >= ncells) return;
@@ -225,11 +264,77 @@ public:
         HPM_DEV_CHECK(hipMemcpy(d_u_.p, u, npts * 8, hipMemcpyHostToDevice));
         resident_ = u; resident_n_ = npts;
     }
-    void EndComponent() override { resident_ = nullptr; resident_n_ = 0; d_k_n_ = 0; }
+    void EndComponent() override { resident_ = nullptr; resident_n_ = 0; d_k_n_ = 0; d_basedec_valid_ = false; }
     bool KeepsDeviceSymbols() const override { return true; }
     const int32_t* DeviceSymbols() const override { return d_k_n_ ? static_cast<const int32_t*>(d_k_.p) : nullptr; }
     void CopySymbolsToHost(int32_t* k) const override { if (d_k_n_) HPM_DEV_CHECK(hipMemcpy(k, d_k_.p, d_k_n_ * 4, hipMemcpyDeviceToHost)); }
     void* HostScratch(int slot, size_t bytes) override { pinned_[slot].reserve(bytes); return pinned_[slot].p; }
+
+    // ---- device-resident base path -----------------------------------------------------------------
+    bool SupportsDeviceBase() const override { return true; }
+    bool RestrictDevice(const OperatorSet& ops, size_t ncells, const double* u) override {
+        const size_t npts = ncells * (size_t)ops.nsp_data, nbase = ncells * (size_t)ops.nsp_base;
+        if (!(u == resident_ && resident_n_ == npts)) BeginComponent(u, npts);
+        d_basev_.reserve(nbase * 8);
+        Apply(ops, true, d_u_.p, ncells, d_basev_.p);
+        nbase_ = nbase; d_basedec_valid_ = false;
+        return true;
+    }
+    bool QuantizeToDevice(const double* d_x, size_t n, double q, int32_t* d_k, double* d_dec) {
+        d_flag_.reserve(4); HPM_DEV_CHECK(hipMemset(d_flag_.p, 0, 4));
+        hipLaunchKernelGGL(QuantizeKernel, dim3(GridFor(n)), dim3(kThreads), 0, 0, d_x, (const double*)nullptr, n, 1.0 / q, d_k, (int*)d_flag_.p);
+        HPM_DEV_CHECK(hipGetLastError());
+        if (d_dec) { hipLaunchKernelGGL(DequantKernel, dim3(GridFor(n)), dim3(kThreads), 0, 0, (const int32_t*)d_k, n, q, d_dec); HPM_DEV_CHECK(hipGetLastError()); }
+        int overflow = 0; HPM_DEV_CHECK(hipMemcpy(&overflow, d_flag_.p, 4, hipMemcpyDeviceToHost));
+        return overflow == 0;
+    }
+    bool SplitPlainDevice(size_t ncells, int nb, double qb, DeviceStreams& out) override {
+        const size_t nbase = ncells * (size_t)nb;
+        d_kavg_.reserve(nbase * 4); d_basedec_.reserve(nbase * 8);
+        if (!QuantizeToDevice((const double*)d_basev_.p, nbase, qb, (int32_t*)d_kavg_.p, (double*)d_basedec_.p)) return false;
+        out.d_avg = (const int32_t*)d_kavg_.p; out.n_avg = nbase; out.d_rem = nullptr; out.n_rem = 0;
+        d_basedec_valid_ = true; return true;
+    }
+    bool SplitCellAvgDevice(size_t ncells, int nb, double qb, DeviceStreams& out) override {
+        const size_t nbase = ncells * (size_t)nb;
+        d_avg_.reserve(ncells * 8); d_avgdec_.reserve(ncells * 8); d_kavg_.reserve(ncells * 4); d_krem_.reserve(nbase * 4); d_basedec_.reserve(nbase * 8);
+        hipLaunchKernelGGL(CellMeansKernel, dim3(GridFor(ncells)), dim3(kThreads), 0, 0, (const double*)d_basev_.p, ncells, nb, (double*)d_avg_.p);
+        HPM_DEV_CHECK(hipGetLastError());
+        if (!QuantizeToDevice((const double*)d_avg_.p, ncells, qb, (int32_t*)d_kavg_.p, (double*)d_avgdec_.p)) return false;
+        d_flag_.reserve(4); HPM_DEV_CHECK(hipMemset(d_flag_.p, 0, 4));
+        hipLaunchKernelGGL(CellAvgRemainderKernel, dim3(GridFor(nbase)), dim3(kThreads), 0, 0, (const double*)d_basev_.p, (const double*)d_avgdec_.p, nbase, nb, qb, 1.0 / qb, (int32_t*)d_krem_.p, (double*)d_basedec_.p, (int*)d_flag_.p);
+        HPM_DEV_CHECK(hipGetLastError());
+        int overflow = 0; HPM_DEV_CHECK(hipMemcpy(&overflow, d_flag_.p, 4, hipMemcpyDeviceToHost));
+        if (overflow) return false;
+        out.d_avg = (const int32_t*)d_kavg_.p; out.n_avg = ncells; out.d_rem = (const int32_t*)d_krem_.p; out.n_rem = nb > 1 ? nbase : 0;
+        d_basedec_valid_ = true; return true;
+    }
+    bool SplitDedupDevice(size_t ncells, int nb, double qb, const DedupGeometry& geom, DeviceStreams& out) override {
+        const size_t nbase = ncells * (size_t)nb; const size_t ng = geom.ngroups;
+        if (geom.vid.size() != nbase || geom.perm.size() != nbase) return false;
+        if (geom_key_ != &geom || geom_n_ != nbase) {   // upload the geometry once per cached geometry object
+            std::vector<uint32_t> cnt(ng, 0); for (uint32_t v : geom.vid) ++cnt[v];
+            d_vid_.reserve(nbase * 4); d_perm_.reserve(nbase * 4); d_cnt_.reserve(ng * 4);
+            HPM_DEV_CHECK(hipMemcpy(d_vid_.p, geom.vid.data(), nbase * 4, hipMemcpyHostToDevice));
+            HPM_DEV_CHECK(hipMemcpy(d_perm_.p, geom.perm.data(), nbase * 4, hipMemcpyHostToDevice));
+            HPM_DEV_CHECK(hipMemcpy(d_cnt_.p, cnt.data(), ng * 4, hipMemcpyHostToDevice));
+            geom_key_ = &geom; geom_n_ = nbase;
+        }
+        d_avg_.reserve(ng * 8); d_avgdec_.reserve(ng * 8); d_kavg_.reserve(ng * 4); d_krem_.reserve(nbase * 4); d_basedec_.reserve(nbase * 8); d_sum_.reserve(ng * 8);
+        HPM_DEV_CHECK(hipMemset(d_sum_.p, 0, ng * 8));
+        hipLaunchKernelGGL(GroupSumKernel, dim3(GridFor(nbase)), dim3(kThreads), 0, 0, (const double*)d_basev_.p, (const uint32_t*)d_vid_.p, nbase, (double*)d_sum_.p);
+        hipLaunchKernelGGL(GroupMeanKernel, dim3(GridFor(ng)), dim3(kThreads), 0, 0, (const double*)d_sum_.p, (const uint32_t*)d_cnt_.p, ng, (double*)d_avg_.p);
+        HPM_DEV_CHECK(hipGetLastError());
+        if (!QuantizeToDevice((const double*)d_avg_.p, ng, qb, (int32_t*)d_kavg_.p, (double*)d_avgdec_.p)) return false;
+        d_flag_.reserve(4); HPM_DEV_CHECK(hipMemset(d_flag_.p, 0, 4));
+        hipLaunchKernelGGL(DedupRemainderKernel, dim3(GridFor(nbase)), dim3(kThreads), 0, 0, (const double*)d_basev_.p, (const double*)d_avgdec_.p, (const uint32_t*)d_vid_.p, (const uint32_t*)d_perm_.p, nbase, qb, 1.0 / qb, (int32_t*)d_krem_.p, (double*)d_basedec_.p, (int*)d_flag_.p);
+        HPM_DEV_CHECK(hipGetLastError());
+        int overflow = 0; HPM_DEV_CHECK(hipMemcpy(&overflow, d_flag_.p, 4, hipMemcpyDeviceToHost));
+        if (overflow) return false;
+        out.d_avg = (const int32_t*)d_kavg_.p; out.n_avg = ng; out.d_rem = (const int32_t*)d_krem_.p; out.n_rem = nbase;
+        d_basedec_valid_ = true; return true;
+    }
+    void CopyDeviceToHost(const int32_t* d, size_t n, int32_t* host) const override { HPM_DEV_CHECK(hipMemcpy(host, d, n * 4, hipMemcpyDeviceToHost)); }
 
     void Restrict(const OperatorSet& ops, const double* u, size_t ncells, double* base) override {
         const size_t npts = ncells * (size_t)ops.nsp_data, nbase = ncells * (size_t)ops.nsp_base;
@@ -248,9 +353,12 @@ public:
     bool ResidualFromBase(const OperatorSet& ops, const double* base_dec, size_t ncells, double q, int32_t* k, const double* u) override {
         const size_t npts = ncells * (size_t)ops.nsp_data, nbase = ncells * (size_t)ops.nsp_base;
         if (!(u == resident_ && resident_n_ == npts)) BeginComponent(u, npts);
-        d_base_.reserve(nbase * 8); HPM_DEV_CHECK(hipMemcpy(d_base_.p, base_dec, nbase * 8, hipMemcpyHostToDevice));
+        const void* d_bd = nullptr;
+        if (base_dec) { d_base_.reserve(nbase * 8); HPM_DEV_CHECK(hipMemcpy(d_base_.p, base_dec, nbase * 8, hipMemcpyHostToDevice)); d_bd = d_base_.p; }
+        else if (d_basedec_valid_ && nbase_ == nbase) d_bd = d_basedec_.p;   // resident decoded base from Split*Device
+        else throw std::runtime_error("ResidualFromBase: no decoded base available");
         d_out_.reserve(npts * 8);
-        Apply(ops, false, d_base_.p, ncells, d_out_.p);                 // d_out_ = P base_dec (stays on the device)
+        Apply(ops, false, d_bd, ncells, d_out_.p);                       // d_out_ = P base_dec (stays on the device)
         d_k_.reserve(npts * 4); d_flag_.reserve(4); HPM_DEV_CHECK(hipMemset(d_flag_.p, 0, 4));
         hipLaunchKernelGGL(QuantizeKernel, dim3(GridFor(npts)), dim3(kThreads), 0, 0, (const double*)d_u_.p, (const double*)d_out_.p, npts, 1.0 / q, (int32_t*)d_k_.p, (int*)d_flag_.p);
         HPM_DEV_CHECK(hipGetLastError());
@@ -308,6 +416,9 @@ public:
     }
 private:
     DeviceBuffer d_in_, d_out_, d_m_, d_k_, d_flag_, d_u_, d_base_;
+    DeviceBuffer d_basev_, d_basedec_, d_avg_, d_avgdec_, d_sum_, d_kavg_, d_krem_, d_vid_, d_perm_, d_cnt_;   // device base path
+    const DedupGeometry* geom_key_ = nullptr; size_t geom_n_ = 0;
+    size_t nbase_ = 0; bool d_basedec_valid_ = false;
     PinnedBuffer pinned_[NumHostSlots];
     std::vector<double> op_cache_;
     const double* resident_ = nullptr; size_t resident_n_ = 0;
@@ -342,6 +453,12 @@ public:
     void ReconstructFromBase(const OperatorSet& o, const double* bd, size_t n, const int32_t* k, double q, double* out) override { b_.ReconstructFromBase(o, bd, n, k, q, out); }
     bool ReconstructFromDeviceSymbols(const OperatorSet& o, const double* bd, size_t n, const int32_t* dk, double q, double* out) override { return b_.ReconstructFromDeviceSymbols(o, bd, n, dk, q, out); }
     void* HostScratch(int slot, size_t bytes) override { return b_.HostScratch(slot, bytes); }
+    bool SupportsDeviceBase() const override { return true; }
+    bool RestrictDevice(const OperatorSet& o, size_t n, const double* u) override { return b_.RestrictDevice(o, n, u); }
+    bool SplitCellAvgDevice(size_t n, int nb, double qb, DeviceStreams& out) override { return b_.SplitCellAvgDevice(n, nb, qb, out); }
+    bool SplitDedupDevice(size_t n, int nb, double qb, const DedupGeometry& g, DeviceStreams& out) override { return b_.SplitDedupDevice(n, nb, qb, g, out); }
+    bool SplitPlainDevice(size_t n, int nb, double qb, DeviceStreams& out) override { return b_.SplitPlainDevice(n, nb, qb, out); }
+    void CopyDeviceToHost(const int32_t* d, size_t n, int32_t* host) const override { b_.CopyDeviceToHost(d, n, host); }
 private:
     DeviceBackend& b_;
 };
