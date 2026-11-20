@@ -92,6 +92,13 @@ int ZstdWorkers() {
     }();
     return w;
 }
+// Below this input size the single-threaded path is used: independent jobs cost about 1.4% in size and the
+// stage takes only a few ms there (an 8 MB Huffman stream compresses in ~10 ms); the gain shows on the
+// 100+ MB raw symbol streams (0.10 s -> 0.034 s on 8 workers). HPMGARD_ZSTD_MT_MIN_MB, default 16.
+size_t ZstdMtMinBytes() {
+    static const size_t m = [] { const char* e = std::getenv("HPMGARD_ZSTD_MT_MIN_MB"); const long mb = e ? std::atol(e) : 16; return static_cast<size_t>(std::max(0l, mb)) << 20; }();
+    return m;
+}
 size_t ZstdJobBytes() {
     static const size_t j = [] { const char* e = std::getenv("HPMGARD_ZSTD_JOB_MB"); const long mb = e ? std::atol(e) : 1; return static_cast<size_t>(std::max(1l, mb)) << 20; }();
     return j;
@@ -102,7 +109,7 @@ std::vector<uint8_t> ZstdEncode(const uint8_t* b, size_t n, int level) {
     std::vector<uint8_t> out(ZSTD_compressBound(n));
     size_t c = 0; bool done = false;
     const int workers = ZstdWorkers();
-    if (workers > 1 && n >= (size_t(1) << 20)) {
+    if (workers > 1 && n >= ZstdMtMinBytes()) {
         static thread_local ZSTD_CCtx* cctx = nullptr;   // reused so the worker pool is created once per thread
         if (!cctx) cctx = ZSTD_createCCtx();
         if (cctx) {

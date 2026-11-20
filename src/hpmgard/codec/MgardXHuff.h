@@ -16,10 +16,13 @@ namespace xhuff {
 enum class XType : uint8_t { Huffman = 0, HuffmanZstd = 1, ZeroRleRans = 2, SymbolRans = 3 };
 const char* XTypeName(XType t);
 
-// MGARD-X dictionary (zigzag codes must stay below it) and Huffman block size. Defaults 8192 / 20480;
-// override with HPMGARD_XHUFF_DICT / HPMGARD_XHUFF_BLOCK (read once). Both are recorded in the stream.
+// Largest MGARD-X dictionary allowed (zigzag codes must stay below it; the dictionary actually used is
+// ChooseDict of the stream's largest code) and the Huffman block size. Defaults 65536 / 20480; override with
+// HPMGARD_XHUFF_DICT / HPMGARD_XHUFF_BLOCK (read once). Both are recorded in the stream. A code at or above
+// the cap sends the stream to the in-house Huffman (slow host path on the GPU backend), which happened for
+// the VKI velocity components at 1e-3 and below with the previous 8192 cap.
 inline uint32_t DictSize() {
-    static const uint32_t v = [] { const char* e = std::getenv("HPMGARD_XHUFF_DICT"); const long x = e ? std::atol(e) : 0; return x >= 2 && x <= 65536 ? static_cast<uint32_t>(x) : 8192u; }();
+    static const uint32_t v = [] { const char* e = std::getenv("HPMGARD_XHUFF_DICT"); const long x = e ? std::atol(e) : 0; return x >= 2 && x <= 1048576 ? static_cast<uint32_t>(x) : 65536u; }();
     return v;
 }
 inline uint32_t BlockSize() {
