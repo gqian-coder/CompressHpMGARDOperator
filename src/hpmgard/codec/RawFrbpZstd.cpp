@@ -1,7 +1,7 @@
 #include "hpmgard/codec/Codec.h"
 #include "hpmgard/Bytes.h"
 #include <zstd.h>
-#include <omp.h>
+#include <thread>
 #include <cstdlib>
 #include <algorithm>
 #include <cstring>
@@ -84,11 +84,15 @@ namespace {
 // single-threaded) and HPMGARD_ZSTD_JOB_MB (default 1, the independent job size; smaller = more parallel
 // jobs, slightly less context for the matcher). Needs libzstd built with ZSTD_MULTITHREAD_SUPPORT; when
 // the worker parameter is rejected the single-threaded path is used.
+// No OpenMP call here: this runs on std::async worker threads too, and the Cray OpenMP runtime aborts on
+// omp_get_max_threads() from a non-OpenMP thread. OMP_NUM_THREADS is honoured when set.
 int ZstdWorkers() {
     static const int w = [] {
         const char* e = std::getenv("HPMGARD_ZSTD_WORKERS");
         if (e) return std::max(0, std::atoi(e));
-        return std::min(omp_get_max_threads(), 8);
+        const char* o = std::getenv("OMP_NUM_THREADS");
+        const int n = o ? std::atoi(o) : static_cast<int>(std::thread::hardware_concurrency());
+        return std::max(1, std::min(n > 0 ? n : 8, 8));
     }();
     return w;
 }
