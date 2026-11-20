@@ -51,12 +51,28 @@ public:
     // as with BeginComponent) and reduce on the device.
     virtual void ComponentStats(const double* u, size_t npts, double& lo, double& hi, double& sumsq);
 
+    // ---- block-resident input/output (GPU backends) -------------------------------------------------------
+    // Makes component `comp` of an interleaved block (ncomp values per point) resident without a host copy:
+    // the block is uploaded once per call (chunked, overlapped with a multithreaded copy into pinned staging)
+    // and the kernels read it with stride ncomp. False = unsupported (use ExtractComponent + BeginComponent).
+    virtual bool BeginBlockComponent(const double* /*block*/, size_t /*npts*/, int /*ncomp*/, int /*comp*/) { return false; }
+    // Statistics and the fused compression of the resident (strided) component.
+    virtual bool ComponentStatsResident(double& /*lo*/, double& /*hi*/, double& /*sumsq*/) { return false; }
+    // Reconstruction into a device block buffer (interleaved, ncomp values per point); DownloadBlock copies
+    // the whole block to the host (chunked, overlapped with the copy out of pinned staging).
+    virtual bool ReconstructFusedToBlock(const OperatorSet& /*ops*/, size_t /*ncells*/, BaseMethod /*method*/, const DedupGeometry* /*geom*/, double /*qb*/, double /*qres*/, const int32_t* /*d_avg*/, const int32_t* /*d_rem*/, const int32_t* /*d_res*/, int /*ncomp*/, int /*comp*/) { return false; }
+    virtual bool DownloadBlock(double* /*out*/, size_t /*n*/) { return false; }
+    // Forgets the resident block (the caller's buffer may be reused with new content next call).
+    virtual void EndBlock() {}
+
     // ---- fused one-pass path (GPU backends) -----------------------------------------------------------
     // restrict -> split -> quantise -> decoded base -> prolong -> residual quantise in one kernel per cell
     // batch (dedup: plus a group-sum pass); every symbol stream stays on the device; one overflow flag.
     struct FusedStreams { const int32_t* d_avg = nullptr; size_t n_avg = 0; const int32_t* d_rem = nullptr; size_t n_rem = 0; const int32_t* d_res = nullptr; size_t n_res = 0; };
     virtual bool SupportsFused(const OperatorSet& /*ops*/) const { return false; }
     virtual bool FusedCompress(const OperatorSet& /*ops*/, size_t /*ncells*/, BaseMethod /*method*/, const DedupGeometry* /*geom*/, double /*qb*/, double /*qres*/, const double* /*u*/, FusedStreams& /*out*/) { return false; }
+    // Same on the resident strided component set by BeginBlockComponent.
+    virtual bool FusedCompressResident(const OperatorSet& /*ops*/, size_t /*ncells*/, BaseMethod /*method*/, const DedupGeometry* /*geom*/, double /*qb*/, double /*qres*/, FusedStreams& /*out*/) { return false; }
     // out = P (decoded base from d_avg/d_rem) + d_res * qres, one kernel per cell batch; out on the host
     virtual bool ReconstructFused(const OperatorSet& /*ops*/, size_t /*ncells*/, BaseMethod /*method*/, const DedupGeometry* /*geom*/, double /*qb*/, double /*qres*/, const int32_t* /*d_avg*/, const int32_t* /*d_rem*/, const int32_t* /*d_res*/, double* /*out*/) { return false; }
     // host symbols -> device scratch slot (0 avg, 1 rem, 2 res); pointer valid until the next upload of that slot

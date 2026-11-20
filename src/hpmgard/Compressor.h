@@ -18,7 +18,7 @@ struct CompressStats {
     std::vector<StreamStat> streams;
     double t_stats = 0, t_refactor = 0, t_base = 0, t_residual = 0, t_code = 0, t_tune = 0, t_total = 0;   // seconds
     double t_geom = 0;   // dedup geometry build (0 when served from the process-wide cache)
-    double t_extract = 0, t_upload = 0, t_dec_device = 0, t_dec_output = 0;   // host-side copies: component extraction, upload; decompression device work and output copy
+    double t_extract = 0, t_upload = 0;   // host-side copies: component extraction (0 on the block-resident GPU path), upload
     CompressConfig used;
     std::string tune_report;
     double ratio() const { return compressed_bytes ? double(raw_bytes) / double(compressed_bytes) : 0.0; }
@@ -33,9 +33,19 @@ struct CompressResult {
 // cell in tensor corner order; see CornerPermutation).
 CompressResult Compress(const FieldView& field, const CompressConfig& cfg, const MeshCorners* mesh, const BlockMeta& meta);
 
-// out receives ncells * nsp * ncomp doubles in the original interleaved layout. mesh is needed only
-// for blocks written with DedupSfc; it must be the same mesh (geometry CRCs are checked).
-void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::vector<double>& out, BlockHeader* header_out = nullptr, const std::string& device = "auto");
+struct DecompressStats {
+    double t_total = 0;      // seconds, whole call
+    double t_decode = 0;     // header parse, stream decoding (host zstd, device or host symbol stages) and reconstruction kernels
+    double t_download = 0;   // GPU: one chunked, pipelined copy of the interleaved block to the caller's buffer
+    double t_insert = 0;     // host-produced components written into the interleaved output (constant, raw, MGARD-X, CPU path)
+};
+
+// Writes ncells * nsp * ncomp doubles in the original interleaved layout straight into out (out_count must be
+// exactly that many): no intermediate vector, no zero fill, no second copy. mesh is needed only for blocks
+// written with DedupSfc; it must be the same mesh (geometry CRCs are checked).
+void DecompressInto(const uint8_t* bytes, size_t n, const MeshCorners* mesh, double* out, size_t out_count, BlockHeader* header_out = nullptr, const std::string& device = "auto", DecompressStats* stats = nullptr);
+// Same, into a vector (resized when its size differs; a vector of the right size is reused without a zero fill).
+void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::vector<double>& out, BlockHeader* header_out = nullptr, const std::string& device = "auto", DecompressStats* stats = nullptr);
 
 BlockHeader ReadHeader(const uint8_t* bytes, size_t n);
 std::string DescribeHeader(const BlockHeader& h);

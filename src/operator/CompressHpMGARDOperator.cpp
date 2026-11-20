@@ -194,6 +194,10 @@ size_t CompressHpMGARDOperator::InverseOperate(const char* bufferIn, const size_
         }
         mesh = &m_Mesh.Load(mf, cv, xv, h.blockid, h.shape);
     }
+    if (!h.data_type) {   // double: reconstruct straight into ADIOS2's destination buffer (no intermediate vector, no second copy)
+        DecompressInto(in, sizeIn, mesh, reinterpret_cast<double*>(dataOut), total, nullptr, Param("device", "auto"));
+        return out_bytes;
+    }
     std::vector<double> out;
     Decompress(in, sizeIn, mesh, out, nullptr, Param("device", "auto"));
     if (out.size() != total) throw std::runtime_error("[CompressHpMGARDOperator] decoded size mismatch");

@@ -42,6 +42,7 @@ set(HPMGARD_SOURCES
   src/hpmgard/Header.cpp
   src/hpmgard/Compressor.cpp
   src/hpmgard/BackendCPU.cpp
+  src/hpmgard/HostCopy.cpp
   src/hpmgard/Tuner.cpp
   src/hpmgard/codec/Pipeline.cpp
   src/hpmgard/codec/RawFrbpZstd.cpp

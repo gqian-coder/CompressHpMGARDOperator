@@ -2,6 +2,7 @@
 #include "hpmgard/Backend.h"
 #include "hpmgard/BaseSplit.h"
 #include "hpmgard/Bytes.h"
+#include "hpmgard/HostCopy.h"
 #include "hpmgard/MgardX.h"
 #include "hpmgard/Operators.h"
 #include "hpmgard/Tuner.h"
@@ -28,13 +29,13 @@ inline double Sec(Clock::time_point a, Clock::time_point b) { return std::chrono
 // Gather one component of an interleaved block into a contiguous array (out: npts values).
 void ExtractComponent(const FieldView& f, int c, double* out) {
     const size_t npts = f.ncells * static_cast<size_t>(f.nsp);
-    if (f.ncomp == 1) { std::memcpy(out, f.data, npts * sizeof(double)); return; }
+    if (f.ncomp == 1) { ParallelMemcpy(out, f.data, npts * sizeof(double)); return; }
 #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < npts; ++i) out[i] = f.data[i * f.ncomp + c];
 }
 
 void InsertComponent(const double* in, size_t npts, int c, int ncomp, double* out) {
-    if (ncomp == 1) { std::memcpy(out, in, npts * sizeof(double)); return; }
+    if (ncomp == 1) { ParallelMemcpy(out, in, npts * sizeof(double)); return; }
 #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < npts; ++i) out[i * ncomp + c] = in[i];
 }
@@ -132,6 +133,7 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
         if (!ok) cfg.base_method = BaseMethod::CellAvg;   // dedup needs corner geometry and a p1 closed base
     }
     std::unique_ptr<Backend> be = MakeBackend(cfg.device);
+    struct BlockGuard { Backend& b; explicit BlockGuard(Backend& be) : b(be) {} ~BlockGuard() { b.EndBlock(); } } block_guard(*be);
     const int dev = static_cast<int>(be->type());
     if (cfg.base_codec == "auto") cfg.base_codec = codec::DefaultChain(dev);
     if (cfg.residual_codec == "auto") cfg.residual_codec = codec::DefaultChain(dev);
@@ -196,15 +198,22 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
     auto drop_pending = [&](int comp) { for (auto& pe : pending) if (pe.comp == comp && pe.fut.valid()) pe.fut.wait(); pending.erase(std::remove_if(pending.begin(), pending.end(), [&](const Pending& pe) { return pe.comp == comp; }), pending.end()); };
     for (int c = 0; c < field.ncomp; ++c) {
         const auto tc0 = Clock::now();
-        ExtractComponent(field, c, u);
-        st.t_extract += Sec(tc0, Clock::now());
-        // resident-component session (GPU: one upload; the statistics and every stage below reuse it)
+        // fused GPU path: the interleaved block is uploaded once per call (chunked, overlapped with a multithreaded
+        // copy into pinned staging) and the kernels read component c with stride ncomp: no host extraction copy
+        const bool fused = be->SupportsFused(ops) && !base_mgardx && (cfg.base_method != BaseMethod::DedupSfc || geom);
+        bool have_u = false;
+        auto ensure_u = [&]() { if (!have_u) { const auto te = Clock::now(); ExtractComponent(field, c, u); st.t_extract += Sec(te, Clock::now()); have_u = true; } };
+        const auto tb0 = Clock::now();
+        const bool resident = fused && be->BeginBlockComponent(field.data, npts, field.ncomp, c);
+        st.t_upload += Sec(tb0, Clock::now());
+        if (!resident) ensure_u();
+        // resident-component session for the other paths (GPU: one upload of the extracted component)
         const auto tu = Clock::now();
-        struct Session { Backend& b; Session(Backend& be, const double* u, size_t n) : b(be) { b.BeginComponent(u, n); } ~Session() { b.EndComponent(); } } session(*be, u, npts);
+        struct Session { Backend& b; Session(Backend& be, bool on, const double* u, size_t n) : b(be) { if (on) b.BeginComponent(u, n); } ~Session() { b.EndComponent(); } } session(*be, !resident, u, npts);
         st.t_upload += Sec(tu, Clock::now());
         const auto ts = Clock::now();
         double lo = 0, hi = 0, sumsq = 0;
-        be->ComponentStats(u, npts, lo, hi, sumsq);
+        if (!(resident && be->ComponentStatsResident(lo, hi, sumsq))) { ensure_u(); be->ComponentStats(u, npts, lo, hi, sumsq); }
         const double scale_c = cfg.norm == Norm::RelL2 ? std::sqrt(sumsq / double(npts)) : cfg.norm == Norm::RelRange ? (hi - lo) : 1.0;
         h.var_scale[c] = scale_c;
         st.t_stats += Sec(ts, Clock::now());
@@ -218,6 +227,7 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
             continue;
         }
         if (!(tol > 0.0) || !std::isfinite(tol)) {
+            ensure_u();
             pay.add(c, StreamKind::RawDoubles, StreamCodec::RawDoubles, npts, DoublesToBytes(u, npts));
             st.streams.push_back({c, StreamKind::RawDoubles, "raw", npts, npts * 8});
             continue;
@@ -225,6 +235,7 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
         const double qres = 2.0 * tol;
         h.residual_quantum[c] = qres;
         if (!refactor) {
+            ensure_u();
             const auto tm = Clock::now();
             std::vector<uint8_t> b = mgardx::Compress1D(u, npts, tol, std::numeric_limits<double>::infinity(), 0, static_cast<int>(be->type()));
             st.t_code += Sec(tm, Clock::now());
@@ -233,15 +244,16 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
             continue;
         }
         // --- fused GPU path: restrict, split, quantise, decoded base, prolong, residual in one kernel ---
-        const bool fused = be->SupportsFused(ops) && !base_mgardx && (cfg.base_method != BaseMethod::DedupSfc || geom);
         if (fused) {
             const auto tf = Clock::now();
             const double qb = 2.0 * cfg.base_quantum_ratio * tol;
             h.base_quantum[c] = qb;
             Backend::FusedStreams fsr;
-            const bool ok = be->FusedCompress(ops, field.ncells, cfg.base_method, geom, qb, qres, u, fsr);
+            bool ok = resident && be->FusedCompressResident(ops, field.ncells, cfg.base_method, geom, qb, qres, fsr);
+            if (!ok && !resident) ok = be->FusedCompress(ops, field.ncells, cfg.base_method, geom, qb, qres, u, fsr);
             st.t_refactor += Sec(tf, Clock::now());
             if (!ok) {   // quantiser overflow: store the component raw
+                ensure_u();
                 drop_pending(c);
                 pay.dir.erase(std::remove_if(pay.dir.begin(), pay.dir.end(), [&](const StreamRec& r) { return r.component == c; }), pay.dir.end());
                 pay.add(c, StreamKind::RawDoubles, StreamCodec::RawDoubles, npts, DoublesToBytes(u, npts));
@@ -413,21 +425,37 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
     return res;
 }
 
-void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::vector<double>& out, BlockHeader* header_out, const std::string& device) {
+void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::vector<double>& out, BlockHeader* header_out, const std::string& device, DecompressStats* stats) {
+    const BlockHeader h = ReadHeader(bytes, n);
+    const size_t count = (h.dims.empty() ? 0 : h.dims[0]) * h.nsp * static_cast<size_t>(h.ncomp);
+    if (out.size() != count) out.resize(count);
+    DecompressInto(bytes, n, mesh, out.data(), count, header_out, device, stats);
+}
+
+void DecompressInto(const uint8_t* bytes, size_t n, const MeshCorners* mesh, double* out, size_t out_count, BlockHeader* header_out, const std::string& device, DecompressStats* stats) {
+    const auto t_start = Clock::now();
+    DecompressStats ds;
+    struct StatsOut { DecompressStats& d; DecompressStats* o; Clock::time_point t0; ~StatsOut() { d.t_total = Sec(t0, Clock::now()); if (o) *o = d; } } stats_out{ds, stats, t_start};
     BlockHeader h;
     const size_t off = ParseHeader(bytes, n, h);
     if (header_out) *header_out = h;
     const size_t ncells = h.dims.empty() ? 0 : h.dims[0];
     const size_t npts = ncells * h.nsp;
-    out.assign(npts * h.ncomp, 0.0);
+    if (out_count != npts * static_cast<size_t>(h.ncomp)) throw std::runtime_error("Decompress: output size " + std::to_string(out_count) + " != ncells*nsp*ncomp = " + std::to_string(npts * h.ncomp));
     const uint8_t* payload = bytes + off;
     const size_t payload_bytes = n - off;
     OperatorSet ops; bool have_ops = false;
     std::shared_ptr<const DedupGeometry> geom_sp; const DedupGeometry* geom = nullptr; bool have_geom = false;
     std::unique_ptr<Backend> be = MakeBackend(device);
+    struct BlockGuard { Backend& b; explicit BlockGuard(Backend& be) : b(be) {} ~BlockGuard() { b.EndBlock(); } } block_guard(*be);
     const int dev = static_cast<int>(be->type());
     double* comp = HostArray<double>(*be, Backend::SlotOut, npts);
     std::vector<double> base_dec, avg_dec; std::vector<int32_t> k;
+    // GPU: components reconstructed on the device are written interleaved into a device block and downloaded
+    // once at the end; host-produced components (constant, raw, MGARD-X) are inserted after that download
+    bool device_any = false;
+    std::vector<std::pair<int, std::vector<double>>> host_done;
+    auto emit_host = [&](int cc) { const auto ti = Clock::now(); if (dev != 0) host_done.emplace_back(cc, std::vector<double>(comp, comp + npts)); else InsertComponent(comp, npts, cc, h.ncomp, out); ds.t_insert += Sec(ti, Clock::now()); };
     for (int c = 0; c < h.ncomp; ++c) {
         // collect this component's streams
         const StreamRec *s_avg = nullptr, *s_rem = nullptr, *s_res = nullptr, *s_other = nullptr;
@@ -441,7 +469,7 @@ void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::ve
             else if (s_other->kind == StreamKind::RawDoubles) { std::memcpy(comp, payload + s_other->offset, npts * 8); }
             else if (s_other->kind == StreamKind::Direct) { std::vector<double> d; mgardx::Decompress(payload + s_other->offset, s_other->bytes, d, dev); if (d.size() != npts) throw std::runtime_error("Decompress: MGARD-X size mismatch"); std::copy(d.begin(), d.end(), comp); }
             else throw std::runtime_error("Decompress: unknown stream kind");
-            InsertComponent(comp, npts, c, h.ncomp, out.data());
+            emit_host(c);
             continue;
         }
         if (!s_res) throw std::runtime_error("Decompress: residual stream missing");
@@ -470,8 +498,8 @@ void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::ve
                 return be->UploadSymbols(slot, k.data(), k.size());
             };
             const int32_t* d_avg = to_device(s_avg, 0); const int32_t* d_rem = to_device(s_rem, 1); const int32_t* d_res = to_device(s_res, 2);
-            if (d_res && be->ReconstructFused(ops, ncells, h.base_method, geom, qb, h.residual_quantum[c], d_avg, d_rem, d_res, comp)) {
-                InsertComponent(comp, npts, c, h.ncomp, out.data());
+            if (d_res && be->ReconstructFusedToBlock(ops, ncells, h.base_method, geom, qb, h.residual_quantum[c], d_avg, d_rem, d_res, h.ncomp, c)) {
+                device_any = true;
                 continue;
             }
         }
@@ -518,8 +546,15 @@ void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::ve
             if (k.size() != npts) throw std::runtime_error("Decompress: residual count mismatch");
             be->ReconstructFromBase(ops, base_dec.data(), ncells, k.data(), h.residual_quantum[c], comp);
         }
-        InsertComponent(comp, npts, c, h.ncomp, out.data());
+        emit_host(c);
     }
+    ds.t_decode = Sec(t_start, Clock::now()) - ds.t_insert;
+    const auto td = Clock::now();
+    if (device_any && !be->DownloadBlock(out, out_count)) throw std::runtime_error("Decompress: device block download failed");
+    ds.t_download = Sec(td, Clock::now());
+    const auto ti = Clock::now();
+    for (auto& hd : host_done) InsertComponent(hd.second.data(), npts, hd.first, h.ncomp, out);
+    ds.t_insert += Sec(ti, Clock::now());
 }
 
 } // namespace hpmgard
