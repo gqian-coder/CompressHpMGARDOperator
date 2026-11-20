@@ -90,7 +90,7 @@ int XDevice(int device) { return (device != 0 && (!mgardx::DeviceWorks(device) |
 }
 int MgardXDevice(int device) { return XDevice(device); }
 std::string DefaultChain(int device) { return XDevice(device) != 0 ? "xhuff|zstd:3" : "huffman|zstd:3"; }
-std::string DefaultTuneCodecs(int device) { return XDevice(device) != 0 ? "xhuff|zstd:3,huffman|zstd:3,raw|zstd:3" : "huffman|zstd:3,raw|zstd:3,frbp|zstd:3"; }
+std::string DefaultTuneCodecs(int device) { return XDevice(device) != 0 ? "xhuff|zstd:3,frbp|zstd:3,huffman|zstd:3,raw|zstd:3" : "huffman|zstd:3,raw|zstd:3,frbp|zstd:3"; }
 
 void WarmupStage(const Stage& first, int device) {
     if (IsMgardXStage(first.id)) xhuff::Warmup(XDevice(device), XTypeOf(first));
