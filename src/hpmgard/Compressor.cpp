@@ -197,8 +197,11 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
     for (int c = 0; c < field.ncomp; ++c) {
         const auto tc0 = Clock::now();
         ExtractComponent(field, c, u);
+        st.t_extract += Sec(tc0, Clock::now());
         // resident-component session (GPU: one upload; the statistics and every stage below reuse it)
+        const auto tu = Clock::now();
         struct Session { Backend& b; Session(Backend& be, const double* u, size_t n) : b(be) { b.BeginComponent(u, n); } ~Session() { b.EndComponent(); } } session(*be, u, npts);
+        st.t_upload += Sec(tu, Clock::now());
         const auto ts = Clock::now();
         double lo = 0, hi = 0, sumsq = 0;
         be->ComponentStats(u, npts, lo, hi, sumsq);
@@ -404,7 +407,7 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
     st.t_total = Sec(t0, Clock::now());
     if (cfg.verbose) {
         std::cerr << "[hpmgard] block " << meta.blockid << ": " << raw_bytes << " -> " << st.compressed_bytes << " bytes (CR " << st.ratio() << ") in " << st.t_total << " s"
-                  << " [stats " << st.t_stats << " geom " << st.t_geom << " refactor " << st.t_refactor << " base " << st.t_base << " residual " << st.t_residual << " code " << st.t_code << " tune " << st.t_tune << "]\n";
+                  << " [extract " << st.t_extract << " upload " << st.t_upload << " stats " << st.t_stats << " geom " << st.t_geom << " refactor " << st.t_refactor << " base " << st.t_base << " residual " << st.t_residual << " code " << st.t_code << " tune " << st.t_tune << "]\n";
         for (const auto& s : st.streams) std::cerr << "    comp " << s.component << " kind " << static_cast<int>(s.kind) << " " << s.codec << " " << s.count << " values -> " << s.bytes << " bytes\n";
     }
     return res;
