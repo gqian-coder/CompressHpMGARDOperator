@@ -1,5 +1,6 @@
 #include "hpmgard/codec/Codec.h"
 #include "hpmgard/codec/MgardXHuff.h"
+#include "hpmgard/codec/Frbp.h"
 #include "hpmgard/MgardX.h"
 #include "hpmgard/Bytes.h"
 #include <algorithm>
@@ -95,7 +96,6 @@ void WarmupStage(const Stage& first, int device) {
     if (IsMgardXStage(first.id)) xhuff::Warmup(XDevice(device), XTypeOf(first));
 }
 
-namespace {
 // Container: u8 'P', u8 nstages, per stage {u8 id, u8 param, u64 out_bytes}, u64 n, payload (last stage's bytes)
 std::vector<uint8_t> WrapContainer(std::vector<uint8_t> cur, const std::vector<Stage>& chain, size_t n) {
     std::vector<uint64_t> sizes{cur.size()};
@@ -111,6 +111,7 @@ std::vector<uint8_t> WrapContainer(std::vector<uint8_t> cur, const std::vector<S
     w.bytes(cur.data(), cur.size());
     return w.buf;
 }
+namespace {
 // Inverse of the byte stages: returns the first stage's bytes, the chain and n.
 std::vector<uint8_t> UnwrapContainer(const uint8_t* b, size_t nb, std::vector<Stage>& chain, uint64_t& n) {
     ByteReader r(b, nb);
@@ -159,16 +160,36 @@ std::vector<uint8_t> EncodeSymbols(const int32_t* sym, size_t n, const std::vect
     return WrapContainer(std::move(cur), chain, n);
 }
 
-std::vector<uint8_t> EncodeSymbolsDevice(const int32_t* d_sym, size_t n, const std::vector<Stage>& chain, double eb_info, int device, const std::function<const int32_t*()>& host) {
-    if (chain.empty()) throw std::invalid_argument("EncodeSymbolsDevice: empty chain");
-    if (IsMgardXStage(chain[0].id)) {
-        const int xdev = XDevice(device);
-        if (d_sym && xdev != 0) {
+std::vector<uint8_t> EncodeStage0Device(const int32_t* d_sym, size_t n, const std::vector<Stage>& chain, double eb_info, int device, const std::function<const int32_t*()>& host) {
+    if (chain.empty()) throw std::invalid_argument("EncodeStage0Device: empty chain");
+    if (d_sym && device != 0) {
+        if (IsMgardXStage(chain[0].id)) {
+            const int xdev = XDevice(device);
             std::vector<uint8_t> x;
-            if (xhuff::EncodeDevice(xdev, d_sym, n, XTypeOf(chain[0]), chain[0].param, x)) return WrapContainer(WithMode(1, x), chain, n);
+            if (xdev != 0 && xhuff::EncodeDevice(xdev, d_sym, n, XTypeOf(chain[0]), chain[0].param, x)) return WithMode(1, x);
+        } else if (chain[0].id == StageId::FRBP) {
+            std::vector<uint8_t> x;
+            if (frbp::EncodeDevice(device, d_sym, n, eb_info, x)) return x;
         }
     }
-    return EncodeSymbols(host(), n, chain, eb_info, device, nullptr);
+    const int32_t* sym = host();
+    switch (chain[0].id) {
+    case StageId::Raw: return RawEncode(sym, n);
+    case StageId::FRBP: return FrbpEncode(sym, n, eb_info);
+    case StageId::Huffman: return HuffmanEncode(sym, n, chain[0].param);
+    case StageId::MgardXHuffman:
+    case StageId::MgardXZeroRleRans:
+    case StageId::MgardXSymbolRans: {
+        std::vector<uint8_t> x;
+        if (xhuff::Encode(XDevice(device), sym, n, XTypeOf(chain[0]), chain[0].param, x)) return WithMode(1, x);
+        return WithMode(0, HuffmanEncode(sym, n, 16));
+    }
+    default: throw std::invalid_argument("EncodeStage0Device: bad first stage");
+    }
+}
+
+std::vector<uint8_t> EncodeSymbolsDevice(const int32_t* d_sym, size_t n, const std::vector<Stage>& chain, double eb_info, int device, const std::function<const int32_t*()>& host) {
+    return WrapContainer(EncodeStage0Device(d_sym, n, chain, eb_info, device, host), chain, n);
 }
 
 size_t PeekSymbolCount(const uint8_t* b, size_t nb) {
@@ -201,12 +222,13 @@ size_t DecodeSymbols(const uint8_t* b, size_t nb, std::vector<int32_t>& out, int
 }
 
 const int32_t* DecodeSymbolsToDevice(const uint8_t* b, size_t nb, size_t& n_out, int device) {
-    const int xdev = XDevice(device);
-    if (xdev == 0) return nullptr;
+    if (device == 0) return nullptr;
     std::vector<Stage> chain; uint64_t n = 0;
     std::vector<uint8_t> cur = UnwrapContainer(b, nb, chain, n);
     n_out = n;
-    if (!IsMgardXStage(chain[0].id) || cur.empty() || cur[0] != 1) return nullptr;
+    if (chain[0].id == StageId::FRBP) return frbp::DecodeDevice(device, cur.data(), cur.size(), n);
+    const int xdev = XDevice(device);
+    if (xdev == 0 || !IsMgardXStage(chain[0].id) || cur.empty() || cur[0] != 1) return nullptr;
     return xhuff::DecodeDevice(xdev, cur.data() + 1, cur.size() - 1, n, XTypeOf(chain[0]), chain[0].param);
 }
 

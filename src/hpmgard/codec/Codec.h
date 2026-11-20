@@ -54,11 +54,16 @@ int MgardXDevice(int device);
 // Default chains: "xhuff|zstd:3" where the MGARD-X stages run on a GPU, "huffman|zstd:3" otherwise.
 std::string DefaultChain(int device);
 std::string DefaultTuneCodecs(int device);
-// Device-resident symbols: codes straight from device memory when the first stage can, otherwise fetches the
-// host copy through `host()` (called at most once) and codes it like EncodeSymbols.
+// Device-resident symbols: codes straight from device memory when the first stage can (MGARD-X stages, FRBP),
+// otherwise fetches the host copy through `host()` (called at most once) and codes it like EncodeSymbols.
 std::vector<uint8_t> EncodeSymbolsDevice(const int32_t* d_sym, size_t n, const std::vector<Stage>& chain, double eb_info, int device, const std::function<const int32_t*()>& host);
-// Decodes a stream onto the device when its first stage can (MGARD-X stage, GPU device); returns the device
-// pointer (valid until the next codec call) and the symbol count, or nullptr when the host path must be used.
+// The same split in two: the first stage (device or host) and the byte stages. Lets a caller run the zstd
+// stages of one stream on a worker thread while the device codes the next one.
+std::vector<uint8_t> EncodeStage0Device(const int32_t* d_sym, size_t n, const std::vector<Stage>& chain, double eb_info, int device, const std::function<const int32_t*()>& host);
+std::vector<uint8_t> WrapContainer(std::vector<uint8_t> stage0, const std::vector<Stage>& chain, size_t n);
+// Decodes a stream onto the device when its first stage can (MGARD-X stages, FRBP; GPU device); returns the
+// device pointer (valid until the next codec call of that stage) and the symbol count, or nullptr when the host
+// path must be used. Device-decoded pointers of different stages do not alias each other.
 const int32_t* DecodeSymbolsToDevice(const uint8_t* b, size_t nb, size_t& n_out, int device);
 // Returns the number of symbols decoded (== the count written by EncodeSymbols).
 size_t DecodeSymbols(const uint8_t* b, size_t nb, std::vector<int32_t>& out, int device = 0);

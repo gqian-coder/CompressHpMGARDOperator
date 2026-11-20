@@ -1,3 +1,4 @@
+#include <limits>
 #include "hpmgard/Backend.h"
 #include <algorithm>
 #include <cctype>
@@ -42,6 +43,13 @@ public:
         for (size_t c = 0; c < ncells; ++c) { double s = 0.0; for (int j = 0; j < nb; ++j) s += base[c * nb + j]; avg[c] = s / nb; }
     }
 };
+}
+
+void Backend::ComponentStats(const double* u, size_t npts, double& lo, double& hi, double& sumsq) {
+    double l = std::numeric_limits<double>::infinity(), h = -std::numeric_limits<double>::infinity(), ss = 0.0;
+#pragma omp parallel for schedule(static) reduction(min : l) reduction(max : h) reduction(+ : ss)
+    for (size_t i = 0; i < npts; ++i) { const double v = u[i]; l = std::min(l, v); h = std::max(h, v); ss += v * v; }
+    lo = l; hi = h; sumsq = ss;
 }
 
 std::unique_ptr<Backend> MakeHipBackend();   // BackendHIP.hip (nullptr when not built or no device)

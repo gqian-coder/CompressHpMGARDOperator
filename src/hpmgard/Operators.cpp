@@ -1,3 +1,4 @@
+#include <map>
 #include "hpmgard/Operators.h"
 #include "hpmgard/Quadrature.h"
 #include "ported/rp_operators.h"
@@ -166,7 +167,38 @@ void ComposeDense(const Table& t, int p, int p_base, int nsp_data, int nsp_base,
 
 } // namespace
 
+std::vector<double> KroneckerFull(const std::vector<double>& M1, int n_out, int n_in, int dim) {
+    std::vector<double> full(1, 1.0); int ro = 1, ci = 1;
+    for (int d = 0; d < dim; ++d) {
+        std::vector<double> next(static_cast<size_t>(ro) * n_out * ci * n_in);
+        for (int a = 0; a < n_out; ++a) for (int i = 0; i < n_in; ++i)
+            for (int r = 0; r < ro; ++r) for (int c = 0; c < ci; ++c)
+                next[(static_cast<size_t>(a) * ro + r) * (static_cast<size_t>(ci) * n_in) + (static_cast<size_t>(i) * ci + c)] = M1[static_cast<size_t>(a) * n_in + i] * full[static_cast<size_t>(r) * ci + c];
+        full.swap(next); ro *= n_out; ci *= n_in;
+    }
+    return full;
+}
+
+static OperatorSet BuildOperatorsUncached(ElemShape shape, int p, int p_base, NodeSet ns, BaseRepresentation rep);
+
 OperatorSet BuildOperators(ElemShape shape, int p, int p_base, NodeSet ns, BaseRepresentation rep) {
+    static std::mutex m; static std::map<std::string, OperatorSet> cache;
+    const std::string key = std::to_string(static_cast<int>(shape)) + "/" + std::to_string(p) + "/" + std::to_string(p_base) + "/" + std::to_string(static_cast<int>(ns)) + "/" + std::to_string(static_cast<int>(rep));
+    std::lock_guard<std::mutex> lk(m);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    OperatorSet o = BuildOperatorsUncached(shape, p, p_base, ns, rep);
+    o.key = key;
+    if (o.tensor) {   // dense per-cell matrices for the fused GPU kernels
+        const int dim = ShapeDim(shape);
+        o.Rfull = KroneckerFull(o.RE1, p_base + 1, p + 1, dim);
+        o.Pfull = KroneckerFull(o.Pc1, p + 1, p_base + 1, dim);
+    }
+    cache[key] = o;
+    return o;
+}
+
+static OperatorSet BuildOperatorsUncached(ElemShape shape, int p, int p_base, NodeSet ns, BaseRepresentation rep) {
     if (p < 0 || p_base < 0 || p_base > p) throw std::invalid_argument("BuildOperators: need 0 <= p_base <= p");
     OperatorSet o;
     o.shape = shape; o.p = p; o.p_base = p_base; o.node_set = ns;

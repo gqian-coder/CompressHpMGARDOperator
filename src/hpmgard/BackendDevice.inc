@@ -194,6 +194,94 @@ __global__ void DedupRemainderKernel(const double* __restrict__ base, const doub
     k[slot] = kk; base_dec[d] = a + kk * qb;
 }
 
+// per-block partial statistics (min, max, sum of squares) of a component
+__global__ void StatsKernel(const double* __restrict__ u, size_t n, double* __restrict__ partial) {
+    __shared__ double smn[256], smx[256], sss[256];
+    double lo = 1e300, hi = -1e300, ss = 0.0;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) { const double v = u[i]; lo = fmin(lo, v); hi = fmax(hi, v); ss += v * v; }
+    smn[threadIdx.x] = lo; smx[threadIdx.x] = hi; sss[threadIdx.x] = ss;
+    __syncthreads();
+    for (unsigned s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) { smn[threadIdx.x] = fmin(smn[threadIdx.x], smn[threadIdx.x + s]); smx[threadIdx.x] = fmax(smx[threadIdx.x], smx[threadIdx.x + s]); sss[threadIdx.x] += sss[threadIdx.x + s]; }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) { partial[3 * blockIdx.x] = smn[0]; partial[3 * blockIdx.x + 1] = smx[0]; partial[3 * blockIdx.x + 2] = sss[0]; }
+}
+
+// Fused per-cell pipeline. One thread per data node, cells_per_block cells per thread block, dense R
+// (nb x nsp) and P (nsp x nb) from global memory, element values in shared memory.
+// mode 0 plain: k_base per corner -> d_rem (n = nbase), no avg stream
+// mode 1 cellavg: k_avg per cell -> d_avg, k_rem per corner -> d_rem
+// mode 2 dedup: avg_dec per group given (gavg), k_rem per Hilbert slot (inv_perm) -> d_rem
+// mode 3 dedup sums: restrict only and atomically add the corner values into gsum[vid[d]] (no symbols)
+__global__ void FusedCellKernel(const double* __restrict__ u, size_t ncells, int nsp, int nb, int cells_per_block,
+                                const double* __restrict__ R, const double* __restrict__ P, int mode,
+                                const double* __restrict__ gavg, const uint32_t* __restrict__ vid, const uint32_t* __restrict__ inv_perm, double* __restrict__ gsum,
+                                double qb, double inv_qb, double qres, double inv_qres,
+                                int32_t* __restrict__ k_avg, int32_t* __restrict__ k_rem, int32_t* __restrict__ k_res, int* __restrict__ overflow) {
+    extern __shared__ double sm[];
+    const int cl = threadIdx.x / nsp, node = threadIdx.x - cl * nsp;
+    const size_t cell = blockIdx.x * (size_t)cells_per_block + cl;
+    const bool active = cl < cells_per_block && cell < ncells;
+    double* x = sm + (size_t)cl * (nsp + 2 * nb + 1); double* base = x + nsp; double* bdec = base + nb; double* avg = bdec + nb;
+    if (active) x[node] = u[cell * (size_t)nsp + node];
+    __syncthreads();
+    if (active && node < nb) { double sacc = 0.0; const double* r = R + (size_t)node * nsp; for (int i = 0; i < nsp; ++i) sacc += r[i] * x[i]; base[node] = sacc; }
+    __syncthreads();
+    if (mode == 3) { if (active && node < nb) atomicAdd(gsum + vid[cell * (size_t)nb + node], base[node]); return; }
+    if (mode == 1) {
+        if (active && node == 0) {
+            double sacc = 0.0; for (int j = 0; j < nb; ++j) sacc += base[j];
+            const double a = sacc / nb, v = a * inv_qb;
+            int32_t k = 0; if (!(fabs(v) < kMaxQuantMagnitude)) atomicOr(overflow, 1); else k = static_cast<int32_t>(llrint(v));
+            k_avg[cell] = k; avg[0] = k * qb;
+        }
+        __syncthreads();
+    }
+    if (active && node < nb) {
+        const size_t d = cell * (size_t)nb + node;
+        double a = 0.0;
+        if (mode == 1) a = avg[0]; else if (mode == 2) a = gavg[vid[d]];
+        int32_t k = 0;
+        if (!(mode == 1 && nb == 1)) {   // a one-value cell base has no remainder stream (the host path omits it too)
+            const double v = (base[node] - a) * inv_qb;
+            if (!(fabs(v) < kMaxQuantMagnitude)) atomicOr(overflow, 1); else k = static_cast<int32_t>(llrint(v));
+            k_rem[mode == 2 ? inv_perm[d] : d] = k;
+        }
+        bdec[node] = a + k * qb;
+    }
+    __syncthreads();
+    if (active) {
+        double sacc = 0.0; const double* pr = P + (size_t)node * nb; for (int j = 0; j < nb; ++j) sacc += pr[j] * bdec[j];
+        const double v = (x[node] - sacc) * inv_qres;
+        int32_t k = 0; if (!(fabs(v) < kMaxQuantMagnitude)) atomicOr(overflow, 1); else k = static_cast<int32_t>(llrint(v));
+        k_res[cell * (size_t)nsp + node] = k;
+    }
+}
+// Fused reconstruction: out = P (decoded base) + k_res * qres. mode as above (0 plain: k per corner in k_rem; 1 cellavg: k_avg per cell; 2 dedup: gavg per group, k_rem per slot)
+__global__ void ReconstructFusedKernel(size_t ncells, int nsp, int nb, int cells_per_block, const double* __restrict__ P, int mode,
+                                       const int32_t* __restrict__ k_avg, const int32_t* __restrict__ k_rem, const int32_t* __restrict__ k_res,
+                                       const double* __restrict__ gavg, const uint32_t* __restrict__ vid, const uint32_t* __restrict__ inv_perm,
+                                       double qb, double qres, double* __restrict__ out) {
+    extern __shared__ double sm[];
+    const int cl = threadIdx.x / nsp, node = threadIdx.x - cl * nsp;
+    const size_t cell = blockIdx.x * (size_t)cells_per_block + cl;
+    const bool active = cl < cells_per_block && cell < ncells;
+    double* bdec = sm + (size_t)cl * nb;
+    if (active && node < nb) {
+        const size_t d = cell * (size_t)nb + node;
+        double a = 0.0;
+        if (mode == 1) a = k_avg[cell] * qb; else if (mode == 2) a = gavg[vid[d]];
+        const int32_t k = k_rem ? k_rem[mode == 2 ? inv_perm[d] : d] : 0;
+        bdec[node] = a + k * qb;
+    }
+    __syncthreads();
+    if (active) {
+        double sacc = 0.0; const double* pr = P + (size_t)node * nb; for (int j = 0; j < nb; ++j) sacc += pr[j] * bdec[j];
+        out[cell * (size_t)nsp + node] = sacc + k_res[cell * (size_t)nsp + node] * qres;
+    }
+}
+
 __global__ void CellMeansKernel(const double* __restrict__ base, size_t ncells, int nb, double* __restrict__ avg) {
     const size_t c = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
     if (c >= ncells) return;
@@ -269,6 +357,119 @@ public:
     const int32_t* DeviceSymbols() const override { return d_k_n_ ? static_cast<const int32_t*>(d_k_.p) : nullptr; }
     void CopySymbolsToHost(int32_t* k) const override { if (d_k_n_) HPM_DEV_CHECK(hipMemcpy(k, d_k_.p, d_k_n_ * 4, hipMemcpyDeviceToHost)); }
     void* HostScratch(int slot, size_t bytes) override { pinned_[slot].reserve(bytes); return pinned_[slot].p; }
+
+    // ---- statistics on the device -----------------------------------------------------------------------
+    void ComponentStats(const double* u, size_t npts, double& lo, double& hi, double& sumsq) override {
+        if (!(u == resident_ && resident_n_ == npts)) BeginComponent(u, npts);
+        const unsigned grid = static_cast<unsigned>(std::min<size_t>(1024, (npts + 255) / 256));
+        d_partial_.reserve(grid * 3 * 8);
+        hipLaunchKernelGGL(StatsKernel, dim3(grid), dim3(256), 0, 0, (const double*)d_u_.p, npts, (double*)d_partial_.p);
+        HPM_DEV_CHECK(hipGetLastError());
+        std::vector<double> part(grid * 3);
+        HPM_DEV_CHECK(hipMemcpy(part.data(), d_partial_.p, grid * 3 * 8, hipMemcpyDeviceToHost));
+        lo = 1e300; hi = -1e300; sumsq = 0.0;
+        for (unsigned b = 0; b < grid; ++b) { lo = std::min(lo, part[3 * b]); hi = std::max(hi, part[3 * b + 1]); sumsq += part[3 * b + 2]; }
+    }
+
+    // ---- fused path ------------------------------------------------------------------------------------
+    int CellsPerBlock(int nsp, int nb) const {
+        if (nsp > 1024) return 0;
+        const size_t per_cell = static_cast<size_t>(nsp + 2 * nb + 1) * 8;
+        int cpb = std::max(1, std::min(1024 / nsp, static_cast<int>((48u * 1024u) / per_cell)));
+        return cpb;
+    }
+    bool SupportsFused(const OperatorSet& ops) const override { return CellsPerBlock(ops.nsp_data, ops.nsp_base) > 0 && !ops.Rfull.empty() && !ops.Pfull.empty(); }
+    void UploadDense(const OperatorSet& ops) {
+        if (dense_key_ == ops.key && !dense_key_.empty()) return;
+        d_R_.reserve(ops.Rfull.size() * 8); d_P_.reserve(ops.Pfull.size() * 8);
+        HPM_DEV_CHECK(hipMemcpy(d_R_.p, ops.Rfull.data(), ops.Rfull.size() * 8, hipMemcpyHostToDevice));
+        HPM_DEV_CHECK(hipMemcpy(d_P_.p, ops.Pfull.data(), ops.Pfull.size() * 8, hipMemcpyHostToDevice));
+        dense_key_ = ops.key;
+    }
+    void UploadGeometry(const DedupGeometry& geom, size_t nbase) {
+        if (geom_key_ == &geom && geom_n_ == nbase) return;
+        const size_t ng = geom.ngroups;
+        std::vector<uint32_t> cnt(ng, 0), inv(nbase, 0);
+        for (uint32_t v : geom.vid) ++cnt[v];
+        for (size_t slot = 0; slot < nbase; ++slot) inv[geom.perm[slot]] = static_cast<uint32_t>(slot);
+        d_vid_.reserve(nbase * 4); d_perm_.reserve(nbase * 4); d_inv_.reserve(nbase * 4); d_cnt_.reserve(ng * 4);
+        HPM_DEV_CHECK(hipMemcpy(d_vid_.p, geom.vid.data(), nbase * 4, hipMemcpyHostToDevice));
+        HPM_DEV_CHECK(hipMemcpy(d_perm_.p, geom.perm.data(), nbase * 4, hipMemcpyHostToDevice));
+        HPM_DEV_CHECK(hipMemcpy(d_inv_.p, inv.data(), nbase * 4, hipMemcpyHostToDevice));
+        HPM_DEV_CHECK(hipMemcpy(d_cnt_.p, cnt.data(), ng * 4, hipMemcpyHostToDevice));
+        geom_key_ = &geom; geom_n_ = nbase;
+    }
+    bool FusedCompress(const OperatorSet& ops, size_t ncells, BaseMethod method, const DedupGeometry* geom, double qb, double qres, const double* u, FusedStreams& out) override {
+        const int nsp = ops.nsp_data, nb = ops.nsp_base; const size_t npts = ncells * (size_t)nsp, nbase = ncells * (size_t)nb;
+        const int cpb = CellsPerBlock(nsp, nb); if (cpb <= 0) return false;
+        if (!(u == resident_ && resident_n_ == npts)) BeginComponent(u, npts);
+        UploadDense(ops);
+        const int mode = method == BaseMethod::Plain ? 0 : method == BaseMethod::CellAvg ? 1 : 2;
+        if (mode == 2) { if (!geom || geom->vid.size() != nbase) return false; UploadGeometry(*geom, nbase); }
+        const size_t ng = mode == 2 ? geom->ngroups : 0;
+        d_kavg_.reserve(std::max<size_t>(mode == 2 ? ng : ncells, 1) * 4); d_krem_.reserve(nbase * 4); d_k_.reserve(npts * 4); d_flag_.reserve(4);
+        HPM_DEV_CHECK(hipMemset(d_flag_.p, 0, 4));
+        const unsigned grid = static_cast<unsigned>((ncells + cpb - 1) / cpb); const unsigned threads = static_cast<unsigned>(cpb * nsp);
+        const size_t shm = static_cast<size_t>(cpb) * (nsp + 2 * nb + 1) * 8;
+        const double* gavg = nullptr;
+        if (mode == 2) {
+            d_sum_.reserve(ng * 8); d_avg_.reserve(ng * 8); d_avgdec_.reserve(ng * 8);
+            HPM_DEV_CHECK(hipMemset(d_sum_.p, 0, ng * 8));
+            hipLaunchKernelGGL(FusedCellKernel, dim3(grid), dim3(threads), shm, 0, (const double*)d_u_.p, ncells, nsp, nb, cpb, (const double*)d_R_.p, (const double*)d_P_.p, 3,
+                               (const double*)nullptr, (const uint32_t*)d_vid_.p, (const uint32_t*)d_inv_.p, (double*)d_sum_.p, qb, 1.0 / qb, qres, 1.0 / qres,
+                               (int32_t*)nullptr, (int32_t*)nullptr, (int32_t*)nullptr, (int*)d_flag_.p);
+            hipLaunchKernelGGL(GroupMeanKernel, dim3(GridFor(ng)), dim3(kThreads), 0, 0, (const double*)d_sum_.p, (const uint32_t*)d_cnt_.p, ng, (double*)d_avg_.p);
+            HPM_DEV_CHECK(hipGetLastError());
+            hipLaunchKernelGGL(QuantizeKernel, dim3(GridFor(ng)), dim3(kThreads), 0, 0, (const double*)d_avg_.p, (const double*)nullptr, ng, 1.0 / qb, (int32_t*)d_kavg_.p, (int*)d_flag_.p);
+            hipLaunchKernelGGL(DequantKernel, dim3(GridFor(ng)), dim3(kThreads), 0, 0, (const int32_t*)d_kavg_.p, ng, qb, (double*)d_avgdec_.p);
+            HPM_DEV_CHECK(hipGetLastError());
+            gavg = (const double*)d_avgdec_.p;
+        }
+        hipLaunchKernelGGL(FusedCellKernel, dim3(grid), dim3(threads), shm, 0, (const double*)d_u_.p, ncells, nsp, nb, cpb, (const double*)d_R_.p, (const double*)d_P_.p, mode,
+                           gavg, (const uint32_t*)d_vid_.p, (const uint32_t*)d_inv_.p, (double*)nullptr, qb, 1.0 / qb, qres, 1.0 / qres,
+                           (int32_t*)d_kavg_.p, (int32_t*)d_krem_.p, (int32_t*)d_k_.p, (int*)d_flag_.p);
+        HPM_DEV_CHECK(hipGetLastError());
+        int overflow = 0; HPM_DEV_CHECK(hipMemcpy(&overflow, d_flag_.p, 4, hipMemcpyDeviceToHost));   // the one synchronous read of the component
+        if (overflow) return false;
+        out.d_res = (const int32_t*)d_k_.p; out.n_res = npts; d_k_n_ = npts;
+        if (mode == 0) { out.d_avg = (const int32_t*)d_krem_.p; out.n_avg = nbase; out.d_rem = nullptr; out.n_rem = 0; }
+        else { out.d_avg = (const int32_t*)d_kavg_.p; out.n_avg = mode == 2 ? ng : ncells; out.d_rem = (const int32_t*)d_krem_.p; out.n_rem = (mode == 1 && nb == 1) ? 0 : nbase; }
+        return true;
+    }
+    bool ReconstructFused(const OperatorSet& ops, size_t ncells, BaseMethod method, const DedupGeometry* geom, double qb, double qres, const int32_t* d_avg, const int32_t* d_rem, const int32_t* d_res, double* out) override {
+        const int nsp = ops.nsp_data, nb = ops.nsp_base; const size_t npts = ncells * (size_t)nsp, nbase = ncells * (size_t)nb;
+        const int cpb = CellsPerBlock(nsp, nb); if (cpb <= 0 || !d_res) return false;
+        UploadDense(ops);
+        const int mode = method == BaseMethod::Plain ? 0 : method == BaseMethod::CellAvg ? 1 : 2;
+        const double* gavg = nullptr;
+        if (mode == 2) {
+            if (!geom || geom->vid.size() != nbase || !d_avg || !d_rem) return false;
+            UploadGeometry(*geom, nbase);
+            const size_t ng = geom->ngroups; d_avgdec_.reserve(ng * 8);
+            hipLaunchKernelGGL(DequantKernel, dim3(GridFor(ng)), dim3(kThreads), 0, 0, d_avg, ng, qb, (double*)d_avgdec_.p);
+            gavg = (const double*)d_avgdec_.p;
+        } else if (mode == 1) { if (!d_avg) return false; if (nb > 1 && !d_rem) return false; if (nb == 1) d_rem = nullptr; }
+        else { if (!d_avg) return false; d_rem = d_avg; }   // plain: the base symbols are the "avg" stream
+        d_out_.reserve(npts * 8);
+        const unsigned grid = static_cast<unsigned>((ncells + cpb - 1) / cpb); const unsigned threads = static_cast<unsigned>(cpb * nsp);
+        hipLaunchKernelGGL(ReconstructFusedKernel, dim3(grid), dim3(threads), static_cast<size_t>(cpb) * nb * 8, 0, ncells, nsp, nb, cpb, (const double*)d_P_.p, mode,
+                           d_avg, d_rem, d_res, gavg, (const uint32_t*)d_vid_.p, (const uint32_t*)d_inv_.p, qb, qres, (double*)d_out_.p);
+        HPM_DEV_CHECK(hipGetLastError());
+        HPM_DEV_CHECK(hipMemcpy(out, d_out_.p, npts * 8, hipMemcpyDeviceToHost));
+        return true;
+    }
+    const int32_t* UploadSymbols(int slot, const int32_t* host, size_t n) override {
+        if (slot < 0 || slot > 2) return nullptr;
+        d_up_[slot].reserve(std::max<size_t>(n, 1) * 4);
+        HPM_DEV_CHECK(hipMemcpy(d_up_[slot].p, host, n * 4, hipMemcpyHostToDevice));
+        return static_cast<const int32_t*>(d_up_[slot].p);
+    }
+    const int32_t* KeepDeviceSymbols(int slot, const int32_t* d, size_t n) override {
+        if (slot < 0 || slot > 2 || !d) return nullptr;
+        d_up_[slot].reserve(std::max<size_t>(n, 1) * 4);
+        HPM_DEV_CHECK(hipMemcpy(d_up_[slot].p, d, n * 4, hipMemcpyDeviceToDevice));
+        return static_cast<const int32_t*>(d_up_[slot].p);
+    }
 
     // ---- device-resident base path -----------------------------------------------------------------
     bool SupportsDeviceBase() const override { return true; }
@@ -417,6 +618,7 @@ public:
 private:
     DeviceBuffer d_in_, d_out_, d_m_, d_k_, d_flag_, d_u_, d_base_;
     DeviceBuffer d_basev_, d_basedec_, d_avg_, d_avgdec_, d_sum_, d_kavg_, d_krem_, d_vid_, d_perm_, d_cnt_;   // device base path
+    DeviceBuffer d_inv_, d_R_, d_P_, d_partial_, d_up_[3]; std::string dense_key_;                           // fused path
     const DedupGeometry* geom_key_ = nullptr; size_t geom_n_ = 0;
     size_t nbase_ = 0; bool d_basedec_valid_ = false;
     PinnedBuffer pinned_[NumHostSlots];
@@ -453,6 +655,12 @@ public:
     void ReconstructFromBase(const OperatorSet& o, const double* bd, size_t n, const int32_t* k, double q, double* out) override { b_.ReconstructFromBase(o, bd, n, k, q, out); }
     bool ReconstructFromDeviceSymbols(const OperatorSet& o, const double* bd, size_t n, const int32_t* dk, double q, double* out) override { return b_.ReconstructFromDeviceSymbols(o, bd, n, dk, q, out); }
     void* HostScratch(int slot, size_t bytes) override { return b_.HostScratch(slot, bytes); }
+    void ComponentStats(const double* u, size_t n, double& lo, double& hi, double& ss) override { b_.ComponentStats(u, n, lo, hi, ss); }
+    bool SupportsFused(const OperatorSet& o) const override { return b_.SupportsFused(o); }
+    bool FusedCompress(const OperatorSet& o, size_t n, BaseMethod m, const DedupGeometry* g, double qb, double qr, const double* u, FusedStreams& out) override { return b_.FusedCompress(o, n, m, g, qb, qr, u, out); }
+    bool ReconstructFused(const OperatorSet& o, size_t n, BaseMethod m, const DedupGeometry* g, double qb, double qr, const int32_t* a, const int32_t* r, const int32_t* s, double* out) override { return b_.ReconstructFused(o, n, m, g, qb, qr, a, r, s, out); }
+    const int32_t* UploadSymbols(int slot, const int32_t* host, size_t n) override { return b_.UploadSymbols(slot, host, n); }
+    const int32_t* KeepDeviceSymbols(int slot, const int32_t* d, size_t n) override { return b_.KeepDeviceSymbols(slot, d, n); }
     bool SupportsDeviceBase() const override { return true; }
     bool RestrictDevice(const OperatorSet& o, size_t n, const double* u) override { return b_.RestrictDevice(o, n, u); }
     bool SplitCellAvgDevice(size_t n, int nb, double qb, DeviceStreams& out) override { return b_.SplitCellAvgDevice(n, nb, qb, out); }

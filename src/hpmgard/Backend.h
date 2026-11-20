@@ -46,6 +46,24 @@ public:
     // on this backend); nullptr on the CPU.
     virtual const int32_t* DeviceSymbols() const { return nullptr; }
     virtual void CopySymbolsToHost(int32_t* /*k*/) const {}
+    // ---- per-component statistics (min, max, sum of squares) -----------------------------------------
+    // Default: host OpenMP pass (BackendCPU.cpp). GPU backends upload the component (it becomes resident,
+    // as with BeginComponent) and reduce on the device.
+    virtual void ComponentStats(const double* u, size_t npts, double& lo, double& hi, double& sumsq);
+
+    // ---- fused one-pass path (GPU backends) -----------------------------------------------------------
+    // restrict -> split -> quantise -> decoded base -> prolong -> residual quantise in one kernel per cell
+    // batch (dedup: plus a group-sum pass); every symbol stream stays on the device; one overflow flag.
+    struct FusedStreams { const int32_t* d_avg = nullptr; size_t n_avg = 0; const int32_t* d_rem = nullptr; size_t n_rem = 0; const int32_t* d_res = nullptr; size_t n_res = 0; };
+    virtual bool SupportsFused(const OperatorSet& /*ops*/) const { return false; }
+    virtual bool FusedCompress(const OperatorSet& /*ops*/, size_t /*ncells*/, BaseMethod /*method*/, const DedupGeometry* /*geom*/, double /*qb*/, double /*qres*/, const double* /*u*/, FusedStreams& /*out*/) { return false; }
+    // out = P (decoded base from d_avg/d_rem) + d_res * qres, one kernel per cell batch; out on the host
+    virtual bool ReconstructFused(const OperatorSet& /*ops*/, size_t /*ncells*/, BaseMethod /*method*/, const DedupGeometry* /*geom*/, double /*qb*/, double /*qres*/, const int32_t* /*d_avg*/, const int32_t* /*d_rem*/, const int32_t* /*d_res*/, double* /*out*/) { return false; }
+    // host symbols -> device scratch slot (0 avg, 1 rem, 2 res); pointer valid until the next upload of that slot
+    virtual const int32_t* UploadSymbols(int /*slot*/, const int32_t* /*host*/, size_t /*n*/) { return nullptr; }
+    // device symbols (e.g. a codec's scratch, reused by its next call) -> the same stable slot
+    virtual const int32_t* KeepDeviceSymbols(int /*slot*/, const int32_t* /*d*/, size_t /*n*/) { return nullptr; }
+
     // ---- device-resident base path (GPU backends) ---------------------------------------------------
     // Restrict -> split (cell average / dedup / plain) -> quantise -> decoded base, all on the device; the
     // quantised base streams are exposed as device pointers (valid until the next base call) and the decoded

@@ -47,6 +47,7 @@ set(HPMGARD_SOURCES
   src/hpmgard/codec/RawFrbpZstd.cpp
   src/hpmgard/codec/Huffman.cpp
   src/hpmgard/codec/MgardXHuff.cpp
+  src/hpmgard/codec/FrbpDispatch.cpp
   src/hpmgard/ported/rp_operators.cpp
   src/hpmgard/ported/tet_rp_operators.cpp
   src/hpmgard/ported/prism_rp_operators.cpp
@@ -60,15 +61,15 @@ target_include_directories(hpmgard
 target_link_libraries(hpmgard PUBLIC OpenMP::OpenMP_CXX ZSTD::ZSTD)
 target_compile_features(hpmgard PUBLIC cxx_std_17)
 if(HPMGARD_ENABLE_HIP)
-  target_sources(hpmgard PRIVATE src/hpmgard/BackendHIP.hip)
-  set_source_files_properties(src/hpmgard/BackendHIP.hip PROPERTIES LANGUAGE HIP)
+  target_sources(hpmgard PRIVATE src/hpmgard/BackendHIP.hip src/hpmgard/codec/Frbp_HIP.hip)
+  set_source_files_properties(src/hpmgard/BackendHIP.hip src/hpmgard/codec/Frbp_HIP.hip PROPERTIES LANGUAGE HIP)
   target_compile_definitions(hpmgard PUBLIC HPMGARD_HAVE_HIP)
   target_link_libraries(hpmgard PUBLIC hip::host)
   message(STATUS "hpMGARD: HIP backend enabled (arch ${CMAKE_HIP_ARCHITECTURES})")
 endif()
 if(HPMGARD_ENABLE_CUDA)
-  target_sources(hpmgard PRIVATE src/hpmgard/BackendCUDA.cu)
-  set_source_files_properties(src/hpmgard/BackendCUDA.cu PROPERTIES LANGUAGE CUDA)
+  target_sources(hpmgard PRIVATE src/hpmgard/BackendCUDA.cu src/hpmgard/codec/Frbp_CUDA.cu)
+  set_source_files_properties(src/hpmgard/BackendCUDA.cu src/hpmgard/codec/Frbp_CUDA.cu PROPERTIES LANGUAGE CUDA)
   target_compile_definitions(hpmgard PUBLIC HPMGARD_HAVE_CUDA)
   target_link_libraries(hpmgard PUBLIC CUDA::cudart)
   message(STATUS "hpMGARD: CUDA backend enabled (arch ${CMAKE_CUDA_ARCHITECTURES}); not yet validated on NVIDIA hardware")

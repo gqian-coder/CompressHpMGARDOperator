@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -144,11 +145,7 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
     }
     st.used = cfg;
 
-    // --- statistics ---------------------------------------------------------------------------------
-    const auto ts = Clock::now();
-    const FieldStats fs = ComputeStats(field);
-    const std::vector<double> scale = ScaleFor(fs, npts, cfg.norm);
-    st.t_stats = Sec(ts, Clock::now());
+    // statistics are computed per component (on the device for GPU backends) inside the loop below
 
     BlockHeader h;
     h.blockid = meta.blockid; h.dims = meta.dims; h.data_type = meta.data_type;
@@ -162,7 +159,7 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
     h.node_set = cfg.node_set; h.base_order = static_cast<uint8_t>(cfg.base_order); h.base_method = cfg.base_method; h.norm = cfg.abs_tolerance.empty() ? cfg.norm : Norm::Abs; h.tolerance = cfg.abs_tolerance.empty() ? cfg.tolerance : cfg.abs_tolerance[0];
     h.base_codec = cfg.base_codec; h.residual_codec = cfg.residual_codec; h.direct_mgardx = cfg.direct_mgardx ? 1 : 0;
     h.conn_var = meta.conn_var; h.coords_var = meta.coords_var;
-    h.var_scale = scale; h.tol_abs.assign(field.ncomp, 0.0); h.base_quantum.assign(field.ncomp, 0.0); h.residual_quantum.assign(field.ncomp, 0.0);
+    h.var_scale.assign(field.ncomp, 1.0); h.tol_abs.assign(field.ncomp, 0.0); h.base_quantum.assign(field.ncomp, 0.0); h.residual_quantum.assign(field.ncomp, 0.0);
     { int ma, mi, pa; mgardx::Version(ma, mi, pa); h.mgardx_version[0] = ma; h.mgardx_version[1] = mi; h.mgardx_version[2] = pa; }
     h.writer = std::string("hpmgard ") + std::to_string(kSoftwareVersion[0]) + "." + std::to_string(kSoftwareVersion[1]) + "." + std::to_string(kSoftwareVersion[2]) + " " + be->name();
     h.writer_backend = static_cast<uint8_t>(be->type());
@@ -192,14 +189,27 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
     const size_t nbase_max = refactor ? field.ncells * static_cast<size_t>(ops.nsp_base) : 0;
     double* base = refactor ? HostArray<double>(*be, Backend::SlotBase, nbase_max) : nullptr;
     double* base_dec = refactor ? HostArray<double>(*be, Backend::SlotBaseDec, nbase_max) : nullptr;
+    // byte stages (zstd) of already device-coded streams run on worker threads while the device codes the next
+    // stream or component; the containers are appended to the payload at the end, in stream order
+    struct Pending { int comp; StreamKind kind; std::vector<codec::Stage> chain; size_t count; std::future<std::vector<uint8_t>> fut; };
+    std::vector<Pending> pending;
+    auto drop_pending = [&](int comp) { for (auto& pe : pending) if (pe.comp == comp && pe.fut.valid()) pe.fut.wait(); pending.erase(std::remove_if(pending.begin(), pending.end(), [&](const Pending& pe) { return pe.comp == comp; }), pending.end()); };
     for (int c = 0; c < field.ncomp; ++c) {
         const auto tc0 = Clock::now();
         ExtractComponent(field, c, u);
-        const double tol = !cfg.abs_tolerance.empty() ? cfg.abs_tolerance[c] : (cfg.norm == Norm::Abs) ? cfg.tolerance : cfg.tolerance * scale[c];
+        // resident-component session (GPU: one upload; the statistics and every stage below reuse it)
+        struct Session { Backend& b; Session(Backend& be, const double* u, size_t n) : b(be) { b.BeginComponent(u, n); } ~Session() { b.EndComponent(); } } session(*be, u, npts);
+        const auto ts = Clock::now();
+        double lo = 0, hi = 0, sumsq = 0;
+        be->ComponentStats(u, npts, lo, hi, sumsq);
+        const double scale_c = cfg.norm == Norm::RelL2 ? std::sqrt(sumsq / double(npts)) : cfg.norm == Norm::RelRange ? (hi - lo) : 1.0;
+        h.var_scale[c] = scale_c;
+        st.t_stats += Sec(ts, Clock::now());
+        const double tol = !cfg.abs_tolerance.empty() ? cfg.abs_tolerance[c] : (cfg.norm == Norm::Abs) ? cfg.tolerance : cfg.tolerance * scale_c;
         h.tol_abs[c] = tol;
         // constant component: one value
-        if (fs.hi[c] == fs.lo[c]) {
-            std::vector<double> one{fs.lo[c]};
+        if (hi == lo) {
+            std::vector<double> one{lo};
             pay.add(c, StreamKind::Const, StreamCodec::Const, npts, DoublesToBytes(one));
             st.streams.push_back({c, StreamKind::Const, "const", npts, 8});
             continue;
@@ -219,8 +229,35 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
             st.streams.push_back({c, StreamKind::Direct, "mgardx", npts, b.size()});
             continue;
         }
+        // --- fused GPU path: restrict, split, quantise, decoded base, prolong, residual in one kernel ---
+        const bool fused = be->SupportsFused(ops) && !base_mgardx && (cfg.base_method != BaseMethod::DedupSfc || geom);
+        if (fused) {
+            const auto tf = Clock::now();
+            const double qb = 2.0 * cfg.base_quantum_ratio * tol;
+            h.base_quantum[c] = qb;
+            Backend::FusedStreams fsr;
+            const bool ok = be->FusedCompress(ops, field.ncells, cfg.base_method, geom, qb, qres, u, fsr);
+            st.t_refactor += Sec(tf, Clock::now());
+            if (!ok) {   // quantiser overflow: store the component raw
+                drop_pending(c);
+                pay.dir.erase(std::remove_if(pay.dir.begin(), pay.dir.end(), [&](const StreamRec& r) { return r.component == c; }), pay.dir.end());
+                pay.add(c, StreamKind::RawDoubles, StreamCodec::RawDoubles, npts, DoublesToBytes(u, npts));
+                st.streams.push_back({c, StreamKind::RawDoubles, "raw", npts, npts * 8});
+                continue;
+            }
+            auto code_async = [&](const int32_t* d, size_t n, StreamKind kind, const std::vector<codec::Stage>& chain, double q) {
+                const auto tk = Clock::now();
+                std::vector<uint8_t> s0 = codec::EncodeStage0Device(d, n, chain, q, dev, [&]() { be->CopyDeviceToHost(d, n, kres); return static_cast<const int32_t*>(kres); });
+                st.t_code += Sec(tk, Clock::now());
+                pending.push_back({c, kind, chain, n, std::async(std::launch::async, [s0 = std::move(s0), chain, n]() mutable { return codec::WrapContainer(std::move(s0), chain, n); })});
+            };
+            code_async(fsr.d_avg, fsr.n_avg, StreamKind::Avg, base_chain, qb);
+            if (fsr.n_rem) code_async(fsr.d_rem, fsr.n_rem, StreamKind::Remainder, res_chain, qb);
+            code_async(fsr.d_res, fsr.n_res, StreamKind::Residual, res_chain, qres);
+            (void)tc0;
+            continue;
+        }
         // --- base ---
-        struct Session { Backend& b; Session(Backend& be, const double* u, size_t n) : b(be) { b.BeginComponent(u, n); } ~Session() { b.EndComponent(); } } session(*be, u, npts);
         const auto tr = Clock::now();
         const size_t nbase = nbase_max;
         // device-resident base path: restrict, split, quantise and decode the base on the device; the base
@@ -350,6 +387,12 @@ CompressResult Compress(const FieldView& field, const CompressConfig& cfg_in, co
         }
         (void)tc0;
     }
+    // append the asynchronously wrapped streams (stream order within each component is kept)
+    for (Pending& pe : pending) {
+        std::vector<uint8_t> b = pe.fut.get();
+        pay.add(pe.comp, pe.kind, StreamCodec::SymbolChain, pe.count, b);
+        st.streams.push_back({pe.comp, pe.kind, codec::ChainString(pe.chain), pe.count, b.size()});
+    }
     // rebuild the stream list in payload order (raw fallbacks may have reordered the record list)
     h.streams = pay.dir;
     std::vector<uint8_t> header = SerializeHeader(h);
@@ -402,8 +445,34 @@ void Decompress(const uint8_t* bytes, size_t n, const MeshCorners* mesh, std::ve
         if (!have_ops) { ops = BuildOperators(h.shape, h.p, h.base_order, h.node_set, h.base_rep); have_ops = true; }
         const int nb = ops.nsp_base;
         const size_t nbase = ncells * static_cast<size_t>(nb);
-        base_dec.assign(nbase, 0.0);
         const double qb = h.base_quantum[c];
+        // --- fused GPU reconstruction: every stream decoded on (or uploaded to) the device, one kernel per cell batch ---
+        if (dev != 0 && be->SupportsFused(ops) && (!s_avg || s_avg->codec == StreamCodec::SymbolChain) && (!s_rem || s_rem->codec == StreamCodec::SymbolChain) && s_res->codec == StreamCodec::SymbolChain
+            && (h.base_method != BaseMethod::DedupSfc || true)) {
+            if (h.base_method == BaseMethod::DedupSfc) {
+                if (!mesh || mesh->empty()) throw std::runtime_error("Decompress: this block was written with dedup_sfc and needs the mesh corners");
+                if (!have_geom) {
+                    geom_sp = CachedDedupGeometry(*mesh); geom = geom_sp.get(); have_geom = true;
+                    if (geom->ngroups != h.num_vertex_groups || geom->crc_vid != h.crc_vid || geom->crc_perm != h.crc_perm)
+                        throw std::runtime_error("Decompress: mesh geometry does not match the block (vertex groups or Hilbert order differ)");
+                }
+            }
+            auto to_device = [&](const StreamRec* s, int slot) -> const int32_t* {
+                if (!s) return nullptr;
+                size_t n2 = 0;
+                const int32_t* d = codec::DecodeSymbolsToDevice(payload + s->offset, s->bytes, n2, dev);
+                if (d && n2 == s->count) { d = be->KeepDeviceSymbols(slot, d, n2); if (d) return d; }
+                codec::DecodeSymbols(payload + s->offset, s->bytes, k, dev);
+                if (k.size() != s->count) throw std::runtime_error("Decompress: symbol count mismatch");
+                return be->UploadSymbols(slot, k.data(), k.size());
+            };
+            const int32_t* d_avg = to_device(s_avg, 0); const int32_t* d_rem = to_device(s_rem, 1); const int32_t* d_res = to_device(s_res, 2);
+            if (d_res && be->ReconstructFused(ops, ncells, h.base_method, geom, qb, h.residual_quantum[c], d_avg, d_rem, d_res, comp)) {
+                InsertComponent(comp, npts, c, h.ncomp, out.data());
+                continue;
+            }
+        }
+        base_dec.assign(nbase, 0.0);
         auto decode_doubles = [&](const StreamRec& s, std::vector<double>& vals) {
             if (s.codec == StreamCodec::MgardX) { mgardx::Decompress(payload + s.offset, s.bytes, vals, static_cast<int>(be->type())); if (vals.size() != s.count) throw std::runtime_error("Decompress: MGARD-X count mismatch"); }
             else { codec::DecodeSymbols(payload + s.offset, s.bytes, k, static_cast<int>(be->type())); if (k.size() != s.count) throw std::runtime_error("Decompress: symbol count mismatch"); vals.resize(k.size()); for (size_t i = 0; i < k.size(); ++i) vals[i] = k[i] * qb; }
