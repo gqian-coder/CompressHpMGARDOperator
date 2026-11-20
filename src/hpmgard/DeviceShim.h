@@ -21,6 +21,10 @@ using hipError_t = cudaError_t;
 #define hipHostMalloc(ptr, bytes, flags) cudaMallocHost(ptr, bytes)
 #define hipHostMallocDefault 0
 #define hipHostFree cudaFreeHost
+using hipStream_t = cudaStream_t;
+#define hipStreamCreate cudaStreamCreate
+#define hipStreamSynchronize cudaStreamSynchronize
+#define hipMemcpyAsync cudaMemcpyAsync
 #define hipLaunchKernelGGL(kernel, grid, block, shmem, stream, ...) kernel<<<grid, block, shmem, stream>>>(__VA_ARGS__)
 #define HPM_DEVICE_TYPE ::hpmgard::DeviceType::CUDA
 #define HPM_DEVICE_NAME "cuda"
