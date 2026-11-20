@@ -16,17 +16,24 @@ namespace xhuff {
 enum class XType : uint8_t { Huffman = 0, HuffmanZstd = 1, ZeroRleRans = 2, SymbolRans = 3 };
 const char* XTypeName(XType t);
 
-// Largest MGARD-X dictionary allowed (zigzag codes must stay below it; the dictionary actually used is
-// ChooseDict of the stream's largest code) and the Huffman block size. Defaults 65536 / 20480; override with
-// HPMGARD_XHUFF_DICT / HPMGARD_XHUFF_BLOCK (read once). Both are recorded in the stream. A code at or above
-// the cap sends the stream to the in-house Huffman (slow host path on the GPU backend), which happened for
-// the VKI velocity components at 1e-3 and below with the previous 8192 cap.
+// Largest MGARD-X dictionary (zigzag codes >= it are outliers, see OutlierRatio) and the Huffman block size.
+// Defaults 8192 / 4096; override with HPMGARD_XHUFF_DICT / HPMGARD_XHUFF_BLOCK (read once). Both are recorded
+// in the stream. A larger dictionary makes MGARD-X's codebook construction much slower (65536: 2-3x slower
+// coding on the VKI velocity), a smaller block raises the parallelism of its decoder (p4 pressure, 33M
+// symbols: block 20480 decodes in 0.18 s, 4096 in 0.075 s, 1024 in 0.055 s, for +9% / +20% bytes).
 inline uint32_t DictSize() {
-    static const uint32_t v = [] { const char* e = std::getenv("HPMGARD_XHUFF_DICT"); const long x = e ? std::atol(e) : 0; return x >= 2 && x <= 1048576 ? static_cast<uint32_t>(x) : 65536u; }();
+    static const uint32_t v = [] { const char* e = std::getenv("HPMGARD_XHUFF_DICT"); const long x = e ? std::atol(e) : 0; return x >= 2 && x <= 1048576 ? static_cast<uint32_t>(x) : 8192u; }();
     return v;
 }
 inline uint32_t BlockSize() {
-    static const uint32_t v = [] { const char* e = std::getenv("HPMGARD_XHUFF_BLOCK"); const long x = e ? std::atol(e) : 0; return x >= 64 && x <= (1l << 24) ? static_cast<uint32_t>(x) : 20480u; }();
+    static const uint32_t v = [] { const char* e = std::getenv("HPMGARD_XHUFF_BLOCK"); const long x = e ? std::atol(e) : 0; return x >= 64 && x <= (1l << 24) ? static_cast<uint32_t>(x) : 4096u; }();
+    return v;
+}
+// Codes >= the dictionary are stored by MGARD-X as outliers (index + value) when they are at most this
+// fraction of the stream (HPMGARD_XHUFF_OUTLIER, default 0.01); above it the stream falls back to the
+// in-house Huffman. The same value sizes MGARD-X's outlier buffers.
+inline double OutlierRatio() {
+    static const double v = [] { const char* e = std::getenv("HPMGARD_XHUFF_OUTLIER"); const double x = e ? std::atof(e) : 0.01; return x >= 0.0 && x <= 1.0 ? x : 0.01; }();
     return v;
 }
 // Streams shorter than this use the in-house Huffman (MGARD-X's serialised codebook costs ~4 bytes per dictionary entry).

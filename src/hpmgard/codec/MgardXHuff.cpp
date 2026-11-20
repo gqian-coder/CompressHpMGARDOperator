@@ -77,15 +77,17 @@ bool Encode(int device, const int32_t* sym, size_t n, XType t, int level, std::v
     if (!Available(device) || n < kMinSymbols) return false;
     const uint32_t dict_max = DictSize(), block = BlockSize();
     std::vector<int32_t> codes(n);
-    uint32_t zmin = 0xFFFFFFFFu, zmax = 0;
+    uint32_t zmin = 0xFFFFFFFFu, zmax = 0; size_t outliers = 0;
     for (size_t i = 0; i < n; ++i) {
         const uint32_t z = Zigzag(sym[i]);
-        if (z >= dict_max) return false;           // outside the MGARD-X dictionary: let the caller fall back
         codes[i] = static_cast<int32_t>(z);
+        if (z >= dict_max) { ++outliers; continue; }   // stored by MGARD-X as an outlier if few enough
         zmin = std::min(zmin, z); zmax = std::max(zmax, z);
     }
+    if (outliers > static_cast<size_t>(OutlierRatio() * static_cast<double>(n))) return false;   // too many: let the caller fall back
+    if (outliers == n) return false;
     if (!AlphabetOk(t, zmin, zmax)) return false;
-    const uint32_t dict = ChooseDict(zmax);
+    const uint32_t dict = outliers ? dict_max : ChooseDict(zmax);
     std::vector<uint8_t> x;
     bool ok = false;
 #ifdef HPMGARD_HAVE_MGARDX

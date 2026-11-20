@@ -45,9 +45,9 @@ inline mgard_x::Config MakeConfig(XType t, int level, uint32_t dict, uint32_t bl
     cfg.huff_dict_size = dict;
     cfg.huff_block_size = block;
     cfg.zstd_compress_level = level > 0 ? level : 3;
-    // The callers guarantee every code < dict, so MGARD-X's outlier front end never fires; a small ratio
-    // keeps its outlier buffers (n * ratio entries) small instead of n-sized.
-    cfg.estimate_outlier_ratio = 0.01;
+    // The callers admit at most OutlierRatio() codes >= dict (MGARD-X stores them as outliers), so its
+    // outlier buffers (n * ratio entries) stay small instead of n-sized.
+    cfg.estimate_outlier_ratio = OutlierRatio();
     cfg.log_level = 0;
     return cfg;
 }

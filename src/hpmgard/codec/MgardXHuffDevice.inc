@@ -21,22 +21,32 @@ namespace HPM_XNS {
 namespace {
 using I = Impl<HPM_XDEVICE>;
 
-// zigzag into `out`; minmax[0] = max code (init 0), minmax[1] = min code (init 0xFFFFFFFF)
-__global__ void ZigzagMinMaxKernel(const int32_t* __restrict__ in, int32_t* __restrict__ out, size_t n, unsigned* minmax) {
-    __shared__ unsigned smx[256]; __shared__ unsigned smn[256];
-    unsigned lmax = 0, lmin = 0xFFFFFFFFu;
+// zigzag into `out`; stats[0] = max in-dictionary code (init 0), stats[1] = min in-dictionary code
+// (init 0xFFFFFFFF), stats[3] = number of codes >= dict (outliers)
+__global__ void ZigzagMinMaxKernel(const int32_t* __restrict__ in, int32_t* __restrict__ out, size_t n, unsigned dict, unsigned* stats) {
+    __shared__ unsigned smx[256]; __shared__ unsigned smn[256]; __shared__ unsigned sout[256];
+    unsigned lmax = 0, lmin = 0xFFFFFFFFu, lout = 0;
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
         const uint32_t z = (static_cast<uint32_t>(in[i]) << 1) ^ static_cast<uint32_t>(in[i] >> 31);
         out[i] = static_cast<int32_t>(z);
+        if (z >= dict) { ++lout; continue; }
         lmax = max(lmax, z); lmin = min(lmin, z);
     }
-    smx[threadIdx.x] = lmax; smn[threadIdx.x] = lmin;
+    smx[threadIdx.x] = lmax; smn[threadIdx.x] = lmin; sout[threadIdx.x] = lout;
     __syncthreads();
     for (unsigned s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) { smx[threadIdx.x] = max(smx[threadIdx.x], smx[threadIdx.x + s]); smn[threadIdx.x] = min(smn[threadIdx.x], smn[threadIdx.x + s]); }
+        if (threadIdx.x < s) { smx[threadIdx.x] = max(smx[threadIdx.x], smx[threadIdx.x + s]); smn[threadIdx.x] = min(smn[threadIdx.x], smn[threadIdx.x + s]); sout[threadIdx.x] += sout[threadIdx.x + s]; }
         __syncthreads();
     }
-    if (threadIdx.x == 0) { atomicMax(minmax, smx[0]); atomicMin(minmax + 1, smn[0]); }
+    if (threadIdx.x == 0) { atomicMax(stats, smx[0]); atomicMin(stats + 1, smn[0]); atomicAdd(stats + 3, sout[0]); }
+}
+// mismatches between decoded codes and a fresh zigzag of the original symbols (the coded buffer may have
+// had its outliers zeroed in place by MGARD-X)
+__global__ void CountMismatchZigzagKernel(const int32_t* __restrict__ dec, const int32_t* __restrict__ sym, size_t n, unsigned* count) {
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        const uint32_t z = (static_cast<uint32_t>(sym[i]) << 1) ^ static_cast<uint32_t>(sym[i] >> 31);
+        if (static_cast<uint32_t>(dec[i]) != z) atomicAdd(count, 1u);
+    }
 }
 __global__ void UnzigzagKernel(const int32_t* __restrict__ in, int32_t* __restrict__ out, size_t n) {
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
@@ -49,7 +59,7 @@ __global__ void CountMismatchKernel(const int32_t* __restrict__ a, const int32_t
         if (a[i] != b[i]) atomicAdd(count, 1u);
 }
 // Process-lifetime scratch (never freed: freeing in a static destructor after runtime teardown is unsafe).
-struct Scratch { int32_t* codes = nullptr; int32_t* dec = nullptr; size_t cap = 0; unsigned* scalar = nullptr; };   // scalar: [0] max, [1] min, [2] mismatches
+struct Scratch { int32_t* codes = nullptr; int32_t* dec = nullptr; size_t cap = 0; unsigned* scalar = nullptr; };   // scalar: [0] max, [1] min, [2] mismatches, [3] outliers
 Scratch& GetScratch(size_t n) {
     static Scratch s;
     if (!s.scalar) { if (hipMalloc((void**)&s.scalar, 16) != hipSuccess) throw std::runtime_error("device scratch allocation failed"); }
@@ -76,15 +86,16 @@ bool EncodeDevice(const int32_t* d_sym, size_t n, XType t, int level, uint32_t& 
     std::lock_guard<std::mutex> lk(I::Mutex());
     try {
         Scratch& s = GetScratch(n);
-        const unsigned init[3] = {0u, 0xFFFFFFFFu, 0u};
-        if (hipMemcpy(s.scalar, init, 12, hipMemcpyHostToDevice) != hipSuccess) return false;
-        hipLaunchKernelGGL(ZigzagMinMaxKernel, dim3(Blocks(n)), dim3(256), 0, 0, d_sym, s.codes, n, s.scalar);
-        unsigned mm[2] = {0, 0};
-        if (hipMemcpy(mm, s.scalar, 8, hipMemcpyDeviceToHost) != hipSuccess) return false;
+        const unsigned init[4] = {0u, 0xFFFFFFFFu, 0u, 0u};
+        if (hipMemcpy(s.scalar, init, 16, hipMemcpyHostToDevice) != hipSuccess) return false;
+        hipLaunchKernelGGL(ZigzagMinMaxKernel, dim3(Blocks(n)), dim3(256), 0, 0, d_sym, s.codes, n, dict, s.scalar);
+        unsigned st[4] = {0, 0, 0, 0};
+        if (hipMemcpy(st, s.scalar, 16, hipMemcpyDeviceToHost) != hipSuccess) return false;
         if (!DeviceErrorCheck<HPM_XDEVICE>()) return false;
-        if (mm[0] >= dict) return false;            // outside the MGARD-X dictionary: let the caller fall back
-        if (!AlphabetOk(t, mm[1], mm[0])) return false;
-        dict = ChooseDict(mm[0]);
+        const size_t outliers = st[3];
+        if (outliers > static_cast<size_t>(OutlierRatio() * static_cast<double>(n)) || outliers == n) return false;   // let the caller fall back
+        if (!AlphabetOk(t, st[1], st[0])) return false;
+        dict = outliers ? dict : ChooseDict(st[0]);
         I::Entry& e = I::Get(t, level, dict, block, static_cast<mgard_x::SIZE>(n));
         I::SymArray arr({static_cast<mgard_x::SIZE>(n)}, s.codes);   // external allocation: no copy, not freed
         if (!I::CompressArray(e, arr, out)) return false;
@@ -92,7 +103,7 @@ bool EncodeDevice(const int32_t* d_sym, size_t n, XType t, int level, uint32_t& 
             I::ByteArray comp({static_cast<mgard_x::SIZE>(out.size())}); comp.load(out.data());
             I::SymArray dec({static_cast<mgard_x::SIZE>(n)});
             if (!I::DecompressArray(e, comp, dec)) return false;
-            hipLaunchKernelGGL(CountMismatchKernel, dim3(Blocks(n)), dim3(256), 0, 0, dec.data(), s.codes, n, s.scalar + 2);
+            hipLaunchKernelGGL(CountMismatchZigzagKernel, dim3(Blocks(n)), dim3(256), 0, 0, dec.data(), d_sym, n, s.scalar + 2);
             unsigned mism = 0;
             if (hipMemcpy(&mism, s.scalar + 2, 4, hipMemcpyDeviceToHost) != hipSuccess) return false;
             if (!DeviceErrorCheck<HPM_XDEVICE>()) return false;
